@@ -109,11 +109,25 @@ function formatStatus(config: Config): string {
 export default function (pi: ExtensionAPI) {
 	let config = loadConfig();
 
+	async function autoImportFromAuth(ctx: any): Promise<boolean> {
+		const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
+		if (!authKey) return false;
+		// Skip if key already exists in rotation list
+		if (config.keys.some((k) => k.key === authKey)) return false;
+		config.keys.push({ name: "auth", key: authKey });
+		saveConfig(config);
+		return true;
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
 		if (config.keys.length === 0) {
-			ctx.ui.notify("OpenCode: No keys configured. Use /opencode add <name> <key>", "warning");
-			return;
+			if (await autoImportFromAuth(ctx)) {
+				ctx.ui.notify(`OpenCode: Imported key from auth.json → ${applyActiveKey(config, ctx.modelRegistry)}`, "info");
+			} else {
+				ctx.ui.notify("OpenCode: No keys configured. Use /opencode add <name> <key>", "warning");
+				return;
+			}
 		}
 		const keyName = applyActiveKey(config, ctx.modelRegistry);
 		if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
@@ -145,9 +159,15 @@ export default function (pi: ExtensionAPI) {
 			switch (subcommand) {
 				case "status":
 				case "list":
-				case "ls":
-					ctx.ui.notify(formatStatus(config), "info");
+				case "ls": {
+					const status = formatStatus(config);
+					if (config.keys.length === 0) {
+						ctx.ui.notify(`${status}\nUsing auth.json key (no rotation). Add keys with /opencode add.`, "info");
+					} else {
+						ctx.ui.notify(status, "info");
+					}
 					break;
+				}
 
 				case "use": {
 					const targetIndex = indexArg - 1;
