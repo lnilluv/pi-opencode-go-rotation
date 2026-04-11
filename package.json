@@ -1,0 +1,32 @@
+{
+  "name": "@lnilluv/pi-opencode-go-rotation",
+  "version": "1.0.0",
+  "description": "Rotate between multiple OpenCode Go API keys with automatic rate-limit detection",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lnilluv/pi-opencode-go-rotation.git"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "keywords": [
+    "pi-extension",
+    "pi-package",
+    "opencode",
+    "api-key-rotation",
+    "rate-limit"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.66.1"
+  }
+}

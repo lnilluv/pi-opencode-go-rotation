@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Determine version bump
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          last_tag="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -n "$last_tag" ]; then
+            range="${last_tag}..HEAD"
+          else
+            range="HEAD"
+          fi
+
+          subjects="$(git log --format=%s $range)"
+          bodies="$(git log --format=%b $range)"
+
+          bump=""
+          if echo "$subjects" | grep -Eq '^(feat|fix)!:' || echo "$bodies" | grep -q 'BREAKING CHANGE'; then
+            bump="major"
+          elif echo "$subjects" | grep -Eq '^feat(\(.+\))?:'; then
+            bump="minor"
+          elif echo "$subjects" | grep -Eq '^fix(\(.+\))?:'; then
+            bump="patch"
+          fi
+
+          if [ -z "$bump" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No feat/fix commits found since ${last_tag:-repository start}; skipping release."
+            exit 0
+          fi
+
+          branch="${GITHUB_REF_NAME}"
+          current_version="$(node -p "require('./package.json').version")"
+          new_version="$(node - "$current_version" "$branch" "$bump" <<'NODE'
+          const [current, branch, bump] = process.argv.slice(2);
+          const match = current.match(/^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/);
+          if (!match) throw new Error(`Unsupported version: ${current}`);
+
+          let major = Number(match[1]);
+          let minor = Number(match[2]);
+          let patch = Number(match[3]);
+          const prerelease = match[4];
+
+          if (branch === 'dev') {
+            if (prerelease && prerelease.startsWith('dev.')) {
+              const currentN = Number(prerelease.split('.')[1] ?? '0');
+              process.stdout.write(`${major}.${minor}.${patch}-dev.${currentN + 1}`);
+            } else {
+              if (bump === 'major') { major += 1; minor = 0; patch = 0; }
+              else if (bump === 'minor') { minor += 1; patch = 0; }
+              else { patch += 1; }
+              process.stdout.write(`${major}.${minor}.${patch}-dev.0`);
+            }
+          } else {
+            if (bump === 'major') { major += 1; minor = 0; patch = 0; }
+            else if (bump === 'minor') { minor += 1; patch = 0; }
+            else { patch += 1; }
+            process.stdout.write(`${major}.${minor}.${patch}`);
+          }
+          NODE
+          )"
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "bump=$bump" >> "$GITHUB_OUTPUT"
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version (main)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
+        run: npm version ${{ steps.bump.outputs.bump }} --no-git-tag-version
+
+      - name: Bump version (dev)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev'
+        run: npm version prerelease --preid dev --no-git-tag-version
+
+      - name: Capture version tag
+        if: steps.bump.outputs.should_release == 'true'
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish (main)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
+        run: npx npm@11 publish --access public --provenance
+
+      - name: Publish (dev prerelease)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev'
+        run: npx npm@11 publish --access public --provenance --tag dev
+
+      - name: Commit version bump and tag
+        if: steps.bump.outputs.should_release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          VERSION=$(node -p "require('./package.json').version")
+          git add package.json package-lock.json
+          git commit -m "chore(release): v${VERSION}"
+          git tag "v${VERSION}"
+          git push
+          git push --tags
+
+      - name: Create GitHub Release (main)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'main'
+        run: gh release create "${{ steps.version.outputs.tag }}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create GitHub Release (dev prerelease)
+        if: steps.bump.outputs.should_release == 'true' && github.ref_name == 'dev'
+        run: gh release create "${{ steps.version.outputs.tag }}" --prerelease --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
