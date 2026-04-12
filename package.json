@@ -1,7 +1,7 @@
 {
   "name": "@lnilluv/pi-opencode-go-rotation",
   "version": "1.1.0",
-  "description": "Rotate between multiple OpenCode Go API keys with automatic rate-limit detection",
+  "description": "Rotate between multiple OpenCode Go API keys with best-effort reactive key rotation",
   "type": "module",
   "pi": {
     "extensions": [
