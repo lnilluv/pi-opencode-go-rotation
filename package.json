@@ -1,6 +1,6 @@
 {
   "name": "@lnilluv/pi-opencode-go-rotation",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Rotate between multiple OpenCode Go API keys with best-effort reactive key rotation",
   "type": "module",
   "pi": {
