@@ -183,6 +183,19 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 
+				case "next": {
+					if (config.keys.length === 0) {
+						ctx.ui.notify("No keys configured. Use /opencode add <name> <key>.", "warning");
+						return;
+					}
+					config.activeKeyIndex = (config.activeKeyIndex + 1) % config.keys.length;
+					delete config.cooldowns[config.activeKeyIndex];
+					saveConfig(config);
+					const keyName = applyActiveKey(config, ctx.modelRegistry);
+					ctx.ui.notify(`Switched to ${keyName}`, "info");
+					break;
+				}
+
 				case "add": {
 					const name = parts[1];
 					const key = parts[2];
@@ -251,7 +264,7 @@ export default function (pi: ExtensionAPI) {
 
 				default:
 					ctx.ui.notify(
-						"Usage: /opencode [status|use <n>|add <name> <key>|rm <n>|reset|cooldown <min>]",
+						"Usage: /opencode [status|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>]",
 						"info",
 					);
 			}

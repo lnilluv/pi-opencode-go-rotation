@@ -42,6 +42,7 @@ Cooldowns default to 60 minutes. After cooldown expires, the key becomes availab
 |---------|-------------|
 | `/opencode` or `/opencode status` | Show all keys, active key marker, cooldown status |
 | `/opencode use <n>` | Switch to key number `n` (1-based) |
+| `/opencode next` | Advance to the next configured key and clear its cooldown before activating it |
 | `/opencode add <name> <key>` | Add a new key |
 | `/opencode rm <n>` | Remove key number `n` |
 | `/opencode reset` | Clear all cooldowns |
