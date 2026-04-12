@@ -1,6 +1,6 @@
 # pi-opencode-go-rotation
 
-Rotate between multiple OpenCode Go API keys. When one key hits a rate limit (429), the extension switches to the next available key automatically.
+Rotate between multiple OpenCode Go API keys. The extension is best-effort and reactive: it rotates only when `opencode` surfaces a matching assistant error message.
 
 ## Install
 
@@ -24,11 +24,13 @@ The first key added becomes active immediately.
 
 The extension sets the active key as a runtime override, which takes priority over `OPENCODE_API_KEY` environment variables and `auth.json` credentials.
 
-When the OpenCode Go API returns a rate-limit error (HTTP 429, or any message matching `rate.limit`, `quota`, `usage limit`), the extension:
+Because the extension hooks `message_end` error handling, it only reacts after `opencode` surfaces an assistant error. When that error text matches rate-limit or quota wording, the extension:
 
 1. Marks the current key as on cooldown
 2. Switches to the next key not on cooldown
 3. Applies the new key via `setRuntimeApiKey`
+
+This is reactive only: it does not check usage or limits ahead of time.
 
 Pi's built-in auto-retry picks up the new key on the next request.
 
@@ -78,9 +80,11 @@ Set `maxRetries` to at least the number of keys so all keys get a chance before 
 
 ## Limitations
 
-- OpenCode Go has no API for checking remaining quota proactively. Rotation is reactive (triggered by 429 errors).
+- OpenCode Go currently has no API endpoint for checking usage, remaining quota, or limits proactively.
+- If `opencode` hangs, masks the failure, or does not surface a matching error on `message_end`, the extension cannot detect it and will not rotate.
 - When all keys are rate-limited simultaneously, the extension force-advances to the next key and clears its cooldown.
 - Keys added via `/opencode add` are stored in plaintext. The config file is created with `0600` permissions.
+- If `opencode` later adds an API endpoint for Go plan usage/limit verification, this extension can be updated to use it.
 
 ## License
 
