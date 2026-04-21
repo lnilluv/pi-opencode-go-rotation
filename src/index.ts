@@ -77,7 +77,7 @@ function rotateToNextKey(config: Config): number {
 }
 
 /** Set the active key as runtime override (highest priority in auth chain). */
-function applyActiveKey(config: Config, modelRegistry: any): string | undefined {
+function applyActiveKey(config: Config, modelRegistry: { authStorage: { setRuntimeApiKey: (provider: string, key: string) => void } }): string | undefined {
 	const idx = pickAvailableKeyIndex(config);
 	if (idx === undefined) return undefined;
 	modelRegistry.authStorage.setRuntimeApiKey(PROVIDER, config.keys[idx].key);
@@ -109,7 +109,7 @@ function formatStatus(config: Config): string {
 export default function (pi: ExtensionAPI) {
 	let config = loadConfig();
 
-	async function autoImportFromAuth(ctx: any): Promise<boolean> {
+	async function autoImportFromAuth(ctx: { modelRegistry: { getApiKeyForProvider: (provider: string) => Promise<string | undefined> }; ui: { notify: (msg: string, type: string) => void } }): Promise<boolean> {
 		const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
 		if (!authKey) return false;
 		// Skip if key already exists in rotation list
@@ -119,8 +119,14 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	}
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		config = loadConfig();
+		// Skip key application on reload — keys are already active
+		if (event.reason === "reload") {
+			const keyName = applyActiveKey(config, ctx.modelRegistry);
+			if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
+			return;
+		}
 		if (config.keys.length === 0) {
 			if (await autoImportFromAuth(ctx)) {
 				ctx.ui.notify(`OpenCode: Imported key from auth.json → ${applyActiveKey(config, ctx.modelRegistry)}`, "info");
@@ -147,6 +153,26 @@ export default function (pi: ExtensionAPI) {
 		const newIndex = rotateToNextKey(config);
 		const keyName = applyActiveKey(config, ctx.modelRegistry);
 		ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
+	});
+
+	// Proactive rate-limit detection via HTTP status — fires before stream consumption.
+	// This is faster than waiting for message_end error parsing.
+	pi.on("after_provider_response", (event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER) return;
+		if (event.status !== 429) return;
+
+		config = loadConfig();
+		if (config.keys.length <= 1) return; // nothing to rotate to
+
+		// Check if we already rotated for this event to avoid double-rotation
+		// with the message_end handler
+		const now = Date.now();
+		const lastRotation = config.cooldowns[config.activeKeyIndex];
+		if (lastRotation && now - lastRotation < 5_000) return; // rotated less than 5s ago, skip
+
+		const newIndex = rotateToNextKey(config);
+		const keyName = applyActiveKey(config, ctx.modelRegistry);
+		ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
 	});
 
 	pi.registerCommand("opencode", {
@@ -269,5 +295,10 @@ export default function (pi: ExtensionAPI) {
 					);
 			}
 		},
+	});
+
+	pi.on("session_shutdown", async () => {
+		config = loadConfig();
+		saveConfig(config);
 	});
 }

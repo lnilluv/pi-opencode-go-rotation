@@ -16,7 +16,7 @@
     "url": "git+https://github.com/lnilluv/pi-opencode-go-rotation.git"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@mariozechner/pi-coding-agent": ">=0.67.4"
   },
   "keywords": [
     "pi-extension",
@@ -27,6 +27,6 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.66.1"
+    "@mariozechner/pi-coding-agent": ">=0.67.4"
   }
 }
