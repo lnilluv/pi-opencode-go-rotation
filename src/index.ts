@@ -7,6 +7,10 @@ const PROVIDER = "opencode-go";
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "opencode-keys.json");
 const DEFAULT_COOLDOWN_MINUTES = 60;
 const QUOTA_ERROR_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
+const ROTATION_DEDUP_MS = 5_000;
+
+/** Timestamp of the last key rotation (shared between after_provider_response and message_end). */
+let lastRotationTime = 0;
 
 interface KeyEntry {
 	name: string;
@@ -121,7 +125,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		config = loadConfig();
-		// Skip key application on reload — keys are already active
+		// On reload: re-apply active key, skip auto-import
 		if (event.reason === "reload") {
 			const keyName = applyActiveKey(config, ctx.modelRegistry);
 			if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
@@ -150,6 +154,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		// Deduplicate with after_provider_response handler
+		const now = Date.now();
+		if (now - lastRotationTime < ROTATION_DEDUP_MS) return;
+		lastRotationTime = now;
+
 		const newIndex = rotateToNextKey(config);
 		const keyName = applyActiveKey(config, ctx.modelRegistry);
 		ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
@@ -164,11 +173,10 @@ export default function (pi: ExtensionAPI) {
 		config = loadConfig();
 		if (config.keys.length <= 1) return; // nothing to rotate to
 
-		// Check if we already rotated for this event to avoid double-rotation
-		// with the message_end handler
+		// Deduplicate with message_end handler
 		const now = Date.now();
-		const lastRotation = config.cooldowns[config.activeKeyIndex];
-		if (lastRotation && now - lastRotation < 5_000) return; // rotated less than 5s ago, skip
+		if (now - lastRotationTime < ROTATION_DEDUP_MS) return;
+		lastRotationTime = now;
 
 		const newIndex = rotateToNextKey(config);
 		const keyName = applyActiveKey(config, ctx.modelRegistry);
@@ -298,7 +306,6 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		config = loadConfig();
 		saveConfig(config);
 	});
 }
