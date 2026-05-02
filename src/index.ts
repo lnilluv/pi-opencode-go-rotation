@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -6,6 +6,7 @@ import { homedir } from "node:os";
 const PROVIDER = "opencode-go";
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "opencode-keys.json");
 const DEFAULT_COOLDOWN_MINUTES = 60;
+const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
 const QUOTA_ERROR_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
 const ROTATION_DEDUP_MS = 5_000;
 
@@ -21,6 +22,8 @@ interface Config {
 	keys: KeyEntry[];
 	activeKeyIndex: number;
 	cooldownMinutes: number;
+	watchdogEnabled: boolean;
+	watchdogIdleMs: number;
 	/** Key index → epoch ms when cooldown started */
 	cooldowns: Record<number, number>;
 }
@@ -29,6 +32,8 @@ const EMPTY_CONFIG: Config = {
 	keys: [],
 	activeKeyIndex: 0,
 	cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
+	watchdogEnabled: true,
+	watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
 	cooldowns: {},
 };
 
@@ -50,6 +55,86 @@ function saveConfig(config: Config): void {
 
 function getCooldownMs(config: Config): number {
 	return (config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES) * 60_000;
+}
+
+function getWatchdogIdleMs(config: Config): number {
+	return config.watchdogIdleMs > 0 ? config.watchdogIdleMs : DEFAULT_WATCHDOG_IDLE_MS;
+}
+
+export function shouldWatchProvider(provider: string | undefined): boolean {
+	return provider === PROVIDER;
+}
+
+interface TimerApi {
+	setTimeout(callback: () => void, ms: number): unknown;
+	clearTimeout(timer: unknown): void;
+}
+
+export class ProviderIdleWatchdog {
+	private timer: unknown | undefined;
+	private active = false;
+	private timedOut = false;
+	private readonly options: {
+		idleMs: number;
+		onTimeout: () => void;
+		timers?: TimerApi;
+	};
+
+	constructor(options: {
+		idleMs: number;
+		onTimeout: () => void;
+		timers?: TimerApi;
+	}) {
+		this.options = options;
+	}
+
+	start(): void {
+		this.active = true;
+		this.timedOut = false;
+		this.schedule();
+	}
+
+	activity(): void {
+		if (!this.active || this.timedOut) return;
+		this.schedule();
+	}
+
+	stop(): void {
+		this.active = false;
+		this.clear();
+	}
+
+	consumeTimedOut(): boolean {
+		const result = this.timedOut;
+		this.timedOut = false;
+		return result;
+	}
+
+	private getTimers(): TimerApi {
+		return this.options.timers ?? {
+			setTimeout: (callback, ms) => globalThis.setTimeout(callback, ms),
+			clearTimeout: (timer) => globalThis.clearTimeout(timer as Parameters<typeof globalThis.clearTimeout>[0]),
+		};
+	}
+
+	private schedule(): void {
+		this.clear();
+		const timers = this.getTimers();
+		this.timer = timers.setTimeout(() => {
+			if (!this.active || this.timedOut) return;
+			this.timedOut = true;
+			this.active = false;
+			this.timer = undefined;
+			this.options.onTimeout();
+		}, this.options.idleMs);
+	}
+
+	private clear(): void {
+		if (this.timer === undefined) return;
+		const timers = this.getTimers();
+		timers.clearTimeout(this.timer);
+		this.timer = undefined;
+	}
 }
 
 /** Return index of first key not on cooldown, starting from `config.activeKeyIndex`. */
@@ -84,17 +169,22 @@ function rotateToNextKey(config: Config): number {
 function applyActiveKey(config: Config, modelRegistry: { authStorage: { setRuntimeApiKey: (provider: string, key: string) => void } }): string | undefined {
 	const idx = pickAvailableKeyIndex(config);
 	if (idx === undefined) return undefined;
+	if (config.activeKeyIndex !== idx) {
+		config.activeKeyIndex = idx;
+		saveConfig(config);
+	}
 	modelRegistry.authStorage.setRuntimeApiKey(PROVIDER, config.keys[idx].key);
 	return config.keys[idx].name || `key-${idx + 1}`;
 }
 
 function formatStatus(config: Config): string {
+	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
 	if (config.keys.length === 0) {
-		return "No keys configured. Use /opencode add <name> <key>.";
+		return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}`;
 	}
 	const now = Date.now();
 	const cdMs = getCooldownMs(config);
-	return config.keys.map((key, i) => {
+	return `${config.keys.map((key, i) => {
 		const marker = i === config.activeKeyIndex ? "→" : " ";
 		const cooldownStart = config.cooldowns[i];
 		let tag = "";
@@ -103,7 +193,7 @@ function formatStatus(config: Config): string {
 			if (remaining > 0) tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
 		}
 		return `${marker} ${i + 1}. ${key.name} (${key.key.slice(0, 8)}...)${tag}`;
-	}).join("\n");
+	}).join("\n")}\n${watchdogStatus}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,8 +202,51 @@ function formatStatus(config: Config): string {
 
 export default function (pi: ExtensionAPI) {
 	let config = loadConfig();
+	let watchdog: ProviderIdleWatchdog | undefined;
+	let watchdogAbortPending = false;
+	let watchdogAbortMessage: string | undefined;
 
-	async function autoImportFromAuth(ctx: { modelRegistry: { getApiKeyForProvider: (provider: string) => Promise<string | undefined> }; ui: { notify: (msg: string, type: string) => void } }): Promise<boolean> {
+	function stopWatchdog(): boolean {
+		const timedOut = watchdog?.consumeTimedOut() ?? false;
+		watchdog?.stop();
+		watchdog = undefined;
+		return timedOut;
+	}
+
+	function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): string | undefined {
+		config = loadConfig();
+		if (config.keys.length <= 1) return undefined;
+		const now = Date.now();
+		if (now - lastRotationTime >= ROTATION_DEDUP_MS) {
+			lastRotationTime = now;
+			rotateToNextKey(config);
+		}
+		return applyActiveKey(config, ctx.modelRegistry);
+	}
+
+	function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort">): void {
+		config = loadConfig();
+		if (!config.watchdogEnabled) return;
+		stopWatchdog();
+		watchdogAbortPending = false;
+		watchdogAbortMessage = undefined;
+		const idleMs = getWatchdogIdleMs(config);
+		watchdog = new ProviderIdleWatchdog({
+			idleMs,
+			onTimeout: () => {
+				const keyName = rotateForWatchdog(ctx);
+				watchdogAbortPending = true;
+				watchdogAbortMessage = keyName
+					? `OpenCode Go timeout: no provider activity for ${Math.ceil(idleMs / 1000)}s; rotated to ${keyName}; retrying.`
+					: `OpenCode Go timeout: no provider activity for ${Math.ceil(idleMs / 1000)}s; no other key available.`;
+				ctx.ui.notify(watchdogAbortMessage, keyName ? "info" : "warning");
+				ctx.abort();
+			},
+		});
+		watchdog.start();
+	}
+
+	async function autoImportFromAuth(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): Promise<boolean> {
 		const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
 		if (!authKey) return false;
 		// Skip if key already exists in rotation list
@@ -143,9 +276,39 @@ export default function (pi: ExtensionAPI) {
 		if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
 	});
 
+	pi.on("before_provider_request", (_event, ctx) => {
+		if (!shouldWatchProvider(ctx.model?.provider)) {
+			stopWatchdog();
+			return;
+		}
+		startWatchdog(ctx);
+	});
+
+	pi.on("message_update", (event) => {
+		const message = event.message;
+		if (message.role !== "assistant" || !shouldWatchProvider(message.provider)) return;
+		watchdog?.activity();
+	});
+
 	pi.on("message_end", async (event, ctx) => {
 		const message = event.message;
-		if (message.role !== "assistant" || message.provider !== PROVIDER || message.stopReason !== "error") return;
+		if (message.role !== "assistant" || message.provider !== PROVIDER) return;
+
+		const watchdogTimedOut = stopWatchdog();
+		if (watchdogTimedOut || watchdogAbortPending) {
+			const errorMessage = watchdogAbortMessage ?? "OpenCode Go timeout: no provider activity; retrying.";
+			watchdogAbortPending = false;
+			watchdogAbortMessage = undefined;
+			return {
+				message: {
+					...message,
+					stopReason: "error",
+					errorMessage,
+				},
+			};
+		}
+
+		if (message.stopReason !== "error") return;
 		if (!QUOTA_ERROR_RE.test(message.errorMessage ?? "")) return;
 
 		config = loadConfig();
@@ -168,6 +331,7 @@ export default function (pi: ExtensionAPI) {
 	// This is faster than waiting for message_end error parsing.
 	pi.on("after_provider_response", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER) return;
+		watchdog?.activity();
 		if (event.status !== 429) return;
 
 		config = loadConfig();
@@ -296,16 +460,54 @@ export default function (pi: ExtensionAPI) {
 					break;
 				}
 
+				case "watchdog": {
+					const value = parts[1];
+					if (!value || value === "status") {
+						ctx.ui.notify(`Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`, "info");
+						return;
+					}
+					if (value === "on") {
+						config.watchdogEnabled = true;
+						saveConfig(config);
+						ctx.ui.notify(`Watchdog enabled (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`, "info");
+						return;
+					}
+					if (value === "off") {
+						config.watchdogEnabled = false;
+						saveConfig(config);
+						stopWatchdog();
+						ctx.ui.notify("Watchdog disabled", "info");
+						return;
+					}
+					const seconds = parseInt(value, 10);
+					if (isNaN(seconds) || seconds < 1) {
+						ctx.ui.notify("Usage: /opencode watchdog [status|on|off|<seconds>]", "warning");
+						return;
+					}
+					config.watchdogEnabled = true;
+					config.watchdogIdleMs = seconds * 1000;
+					saveConfig(config);
+					ctx.ui.notify(`Watchdog enabled (${seconds}s idle)`, "info");
+					break;
+				}
+
 				default:
 					ctx.ui.notify(
-						"Usage: /opencode [status|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>]",
+						"Usage: /opencode [status|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
 						"info",
 					);
 			}
 		},
 	});
 
+	pi.on("agent_end", () => {
+		stopWatchdog();
+		watchdogAbortPending = false;
+		watchdogAbortMessage = undefined;
+	});
+
 	pi.on("session_shutdown", async () => {
+		stopWatchdog();
 		saveConfig(config);
 	});
 }
