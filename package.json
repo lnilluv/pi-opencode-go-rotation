@@ -1,6 +1,6 @@
 {
   "name": "@lnilluv/pi-opencode-go-rotation",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Rotate between multiple OpenCode Go API keys with best-effort reactive key rotation",
   "type": "module",
   "pi": {
@@ -9,14 +9,15 @@
     ]
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lnilluv/pi-opencode-go-rotation.git"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.67.4"
+    "@mariozechner/pi-coding-agent": ">=0.71.1"
   },
   "keywords": [
     "pi-extension",
@@ -27,6 +28,6 @@
   ],
   "license": "MIT",
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.67.4"
+    "@mariozechner/pi-coding-agent": "0.71.1"
   }
 }

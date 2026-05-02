@@ -6,7 +6,8 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["src"]
+  "include": ["src", "test"]
 }
