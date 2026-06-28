@@ -1,6 +1,6 @@
 # pi-opencode-go-rotation
 
-Rotate between multiple OpenCode Go API keys. The extension is best-effort and reactive: it rotates only when `opencode` surfaces a matching assistant error message.
+Rotate between multiple OpenCode Go API keys. The extension is reactive: it rotates on HTTP 429 responses, surfaced rate-limit errors, and silent stalls detected by the watchdog.
 
 ## Install
 
@@ -46,6 +46,7 @@ Cooldowns default to 60 minutes. After cooldown expires, the key becomes availab
 | `/opencode rm <n>` | Remove key number `n` |
 | `/opencode reset` | Clear all cooldowns |
 | `/opencode cooldown <min>` | Set or view cooldown duration in minutes |
+| `/opencode events` | Show recent watchdog timeout history (last 10) |
 | `/opencode watchdog [status\|on\|off\|<seconds>]` | Configure silent-stall detection |
 
 ## Configuration
