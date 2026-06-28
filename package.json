@@ -1,6 +1,6 @@
 {
   "name": "@lnilluv/pi-opencode-go-rotation",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Rotate between multiple OpenCode Go API keys with reactive 429, rate-limit, and watchdog stall detection",
   "type": "module",
   "main": "./dist/index.js",
