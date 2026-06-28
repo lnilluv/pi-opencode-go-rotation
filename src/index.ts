@@ -1,17 +1,15 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
 const PROVIDER = "opencode-go";
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "opencode-keys.json");
+const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 const DEFAULT_COOLDOWN_MINUTES = 60;
 const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
 const QUOTA_ERROR_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
 const ROTATION_DEDUP_MS = 5_000;
 
-/** Timestamp of the last key rotation (shared between after_provider_response and message_end). */
-let lastRotationTime = 0;
 
 interface KeyEntry {
 	name: string;
@@ -37,10 +35,16 @@ const EMPTY_CONFIG: Config = {
 	cooldowns: {},
 };
 
+function getConfigPath(): string {
+	return process.env[CONFIG_PATH_ENV] ?? join(homedir(), ".pi", "agent", "opencode-keys.json");
+}
+
+
 function loadConfig(): Config {
-	if (!existsSync(CONFIG_PATH)) return { ...EMPTY_CONFIG };
+	const path = getConfigPath();
+	if (!existsSync(path)) return { ...EMPTY_CONFIG };
 	try {
-		const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+		const parsed = JSON.parse(readFileSync(path, "utf-8"));
 		return { ...EMPTY_CONFIG, ...parsed, cooldowns: parsed.cooldowns ?? {} };
 	} catch {
 		return { ...EMPTY_CONFIG };
@@ -48,9 +52,10 @@ function loadConfig(): Config {
 }
 
 function saveConfig(config: Config): void {
-	const dir = join(homedir(), ".pi", "agent");
+	const path = getConfigPath();
+	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
+	writeFileSync(path, JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 function getCooldownMs(config: Config): number {
@@ -65,38 +70,94 @@ export function shouldWatchProvider(provider: string | undefined): boolean {
 	return provider === PROVIDER;
 }
 
-interface TimerApi {
+export interface TimerApi {
 	setTimeout(callback: () => void, ms: number): unknown;
 	clearTimeout(timer: unknown): void;
 }
+
+interface RotateOptions {
+	now?: number;
+}
+
+
+export type ProviderActivityPhase = "waiting-for-response" | "waiting-for-stream" | "streaming";
+
+export interface ProviderTimeoutInfo {
+	phase: ProviderActivityPhase;
+	idleMs: number;
+	elapsedMs: number;
+	idleForMs: number;
+	lastStatus?: number;
+}
+
+export function shouldRotateAfterWatchdogTimeout(timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): boolean {
+	return timeoutInfo.lastStatus !== 429 || !rateLimitAlreadyRotated;
+}
+
+
+export interface ClockApi {
+	now(): number;
+}
+
+export interface ExtensionOptions {
+	timers?: TimerApi;
+	clock?: ClockApi;
+}
+
 
 export class ProviderIdleWatchdog {
 	private timer: unknown | undefined;
 	private active = false;
 	private timedOut = false;
+	private phase: ProviderActivityPhase = "waiting-for-response";
+	private startedAt = 0;
+	private lastActivityAt = 0;
+	private lastStatus: number | undefined;
+	private timeoutInfo: ProviderTimeoutInfo | undefined;
 	private readonly options: {
 		idleMs: number;
 		onTimeout: () => void;
 		timers?: TimerApi;
+		clock?: ClockApi;
 	};
 
 	constructor(options: {
 		idleMs: number;
 		onTimeout: () => void;
 		timers?: TimerApi;
+		clock?: ClockApi;
 	}) {
 		this.options = options;
 	}
 
 	start(): void {
+		const now = this.now();
 		this.active = true;
 		this.timedOut = false;
+		this.timeoutInfo = undefined;
+		this.phase = "waiting-for-response";
+		this.startedAt = now;
+		this.lastActivityAt = now;
+		this.lastStatus = undefined;
 		this.schedule();
+	}
+
+	response(status: number): void {
+		if (!this.active || this.timedOut) return;
+		this.phase = "waiting-for-stream";
+		this.lastStatus = status;
+		this.markActivity();
+	}
+
+	streamActivity(): void {
+		if (!this.active || this.timedOut) return;
+		this.phase = "streaming";
+		this.markActivity();
 	}
 
 	activity(): void {
 		if (!this.active || this.timedOut) return;
-		this.schedule();
+		this.markActivity();
 	}
 
 	stop(): void {
@@ -104,10 +165,25 @@ export class ProviderIdleWatchdog {
 		this.clear();
 	}
 
-	consumeTimedOut(): boolean {
-		const result = this.timedOut;
+
+	consumeTimeoutInfo(): ProviderTimeoutInfo | undefined {
+		const result = this.timeoutInfo;
+		this.timeoutInfo = undefined;
 		this.timedOut = false;
 		return result;
+	}
+
+	currentTimeoutInfo(): ProviderTimeoutInfo | undefined {
+		return this.timeoutInfo;
+	}
+
+	private markActivity(): void {
+		this.lastActivityAt = this.now();
+		this.schedule();
+	}
+
+	private now(): number {
+		return this.options.clock?.now() ?? Date.now();
 	}
 
 	private getTimers(): TimerApi {
@@ -122,6 +198,14 @@ export class ProviderIdleWatchdog {
 		const timers = this.getTimers();
 		this.timer = timers.setTimeout(() => {
 			if (!this.active || this.timedOut) return;
+			const now = this.now();
+			this.timeoutInfo = {
+				phase: this.phase,
+				idleMs: this.options.idleMs,
+				elapsedMs: Math.max(0, now - this.startedAt),
+				idleForMs: Math.max(0, now - this.lastActivityAt),
+				lastStatus: this.lastStatus,
+			};
 			this.timedOut = true;
 			this.active = false;
 			this.timer = undefined;
@@ -138,21 +222,21 @@ export class ProviderIdleWatchdog {
 }
 
 /** Return index of first key not on cooldown, starting from `config.activeKeyIndex`. */
-function pickAvailableKeyIndex(config: Config): number | undefined {
-	const now = Date.now();
+function pickAvailableKeyIndex(config: Config, now = Date.now()): number | undefined {
 	const cdMs = getCooldownMs(config);
 	for (let i = 0; i < config.keys.length; i++) {
 		const idx = (config.activeKeyIndex + i) % config.keys.length;
 		const cooldownStart = config.cooldowns[idx];
-		if (!cooldownStart || now - cooldownStart >= cdMs) return idx;
+		if (cooldownStart === undefined || now - cooldownStart >= cdMs) return idx;
 	}
 	return undefined;
 }
 
 /** Mark current key on cooldown, advance to next available. Returns new index. */
-function rotateToNextKey(config: Config): number {
-	config.cooldowns[config.activeKeyIndex] = Date.now();
-	const next = pickAvailableKeyIndex(config);
+function rotateToNextKey(config: Config, options: RotateOptions = {}): number {
+	const now = options.now ?? Date.now();
+	config.cooldowns[config.activeKeyIndex] = now;
+	const next = pickAvailableKeyIndex(config, now);
 	if (next !== undefined) {
 		config.activeKeyIndex = next;
 		saveConfig(config);
@@ -165,9 +249,10 @@ function rotateToNextKey(config: Config): number {
 	return config.activeKeyIndex;
 }
 
+
 /** Set the active key as runtime override (highest priority in auth chain). */
-function applyActiveKey(config: Config, modelRegistry: { authStorage: { setRuntimeApiKey: (provider: string, key: string) => void } }): string | undefined {
-	const idx = pickAvailableKeyIndex(config);
+function applyActiveKey(config: Config, modelRegistry: { authStorage: { setRuntimeApiKey: (provider: string, key: string) => void } }, now = Date.now()): string | undefined {
+	const idx = pickAvailableKeyIndex(config, now);
 	if (idx === undefined) return undefined;
 	if (config.activeKeyIndex !== idx) {
 		config.activeKeyIndex = idx;
@@ -177,18 +262,17 @@ function applyActiveKey(config: Config, modelRegistry: { authStorage: { setRunti
 	return config.keys[idx].name || `key-${idx + 1}`;
 }
 
-function formatStatus(config: Config): string {
+function formatStatus(config: Config, now = Date.now()): string {
 	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
 	if (config.keys.length === 0) {
 		return `No keys configured. Use /opencode add <name> <key>.\n${watchdogStatus}`;
 	}
-	const now = Date.now();
 	const cdMs = getCooldownMs(config);
 	return `${config.keys.map((key, i) => {
 		const marker = i === config.activeKeyIndex ? "→" : " ";
 		const cooldownStart = config.cooldowns[i];
 		let tag = "";
-		if (cooldownStart) {
+		if (cooldownStart !== undefined) {
 			const remaining = cdMs - (now - cooldownStart);
 			if (remaining > 0) tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
 		}
@@ -196,52 +280,130 @@ function formatStatus(config: Config): string {
 	}).join("\n")}\n${watchdogStatus}`;
 }
 
+interface WatchdogEvent {
+	time: number;
+	keyName?: string;
+	rotatedTo?: string;
+	activeKey?: string;
+	phase: ProviderActivityPhase;
+	idleMs: number;
+	elapsedMs: number;
+	idleForMs: number;
+	lastStatus?: number;
+}
+
+function formatDuration(ms: number): string {
+	const seconds = Math.max(0, Math.ceil(ms / 1000));
+	if (seconds < 60) return `${seconds}s`;
+	const minutes = Math.floor(seconds / 60);
+	const remainder = seconds % 60;
+	return remainder ? `${minutes}m ${remainder}s` : `${minutes}m`;
+}
+
+function formatTimeoutInfo(info: ProviderTimeoutInfo): string {
+	const status = info.lastStatus === undefined ? "" : `, last HTTP ${info.lastStatus}`;
+	return `${info.phase.replaceAll("-", " ")} stalled after ${formatDuration(info.elapsedMs)} (${formatDuration(info.idleForMs)} idle${status})`;
+}
+
+function formatWatchdogEvents(events: WatchdogEvent[], now = Date.now()): string {
+	if (events.length === 0) return "No OpenCode Go watchdog timeouts recorded this session.";
+	return events
+		.slice()
+		.reverse()
+		.map((event, index) => {
+			const age = formatDuration(now - event.time);
+			const key = event.keyName ? ` key=${event.keyName}` : "";
+			const rotation = event.rotatedTo ? ` rotated=${event.rotatedTo}` : event.activeKey ? ` using=${event.activeKey}` : " rotated=none";
+			const status = event.lastStatus === undefined ? "" : ` status=${event.lastStatus}`;
+			return `${index + 1}. ${age} ago ${event.phase.replaceAll("-", " ")}${status}${key}${rotation} elapsed=${formatDuration(event.elapsedMs)} idle=${formatDuration(event.idleForMs)}`;
+		})
+		.join("\n");
+}
+
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
-export default function (pi: ExtensionAPI) {
-	let config = loadConfig();
-	let watchdog: ProviderIdleWatchdog | undefined;
-	let watchdogAbortPending = false;
-	let watchdogAbortMessage: string | undefined;
+export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}) {
+	return function opencodeGoRotationExtension(pi: ExtensionAPI) {
+		let config = loadConfig();
+		let watchdog: ProviderIdleWatchdog | undefined;
+		let watchdogAbortPending = false;
+		let watchdogAbortMessage: string | undefined;
+		let watchdogTimeoutInfo: ProviderTimeoutInfo | undefined;
+		let watchdogRateLimitRotated = false;
+		/** Timestamp of the last surfaced-error key rotation for this extension instance. */
+		let lastRotationTime = Number.NEGATIVE_INFINITY;
+		const watchdogEvents: WatchdogEvent[] = [];
 
-	function stopWatchdog(): boolean {
-		const timedOut = watchdog?.consumeTimedOut() ?? false;
+		const now = (): number => options.clock?.now() ?? Date.now();
+
+
+
+	function stopWatchdog(): ProviderTimeoutInfo | undefined {
+		const timeoutInfo = watchdog?.consumeTimeoutInfo();
 		watchdog?.stop();
 		watchdog = undefined;
-		return timedOut;
+		return timeoutInfo;
 	}
 
-	function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): string | undefined {
+	function resetWatchdogAbortState(): void {
+		watchdogAbortPending = false;
+		watchdogAbortMessage = undefined;
+		watchdogTimeoutInfo = undefined;
+		watchdogRateLimitRotated = false;
+	}
+
+	function recordWatchdogEvent(event: WatchdogEvent): void {
+		watchdogEvents.push(event);
+		while (watchdogEvents.length > 10) watchdogEvents.shift();
+	}
+
+	function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): { keyName?: string; rotated: boolean } {
 		config = loadConfig();
-		if (config.keys.length <= 1) return undefined;
-		const now = Date.now();
-		if (now - lastRotationTime >= ROTATION_DEDUP_MS) {
-			lastRotationTime = now;
-			rotateToNextKey(config);
+		if (config.keys.length <= 1) return { rotated: false };
+		if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
+			rotateToNextKey(config, { now: now() });
+			return { keyName: applyActiveKey(config, ctx.modelRegistry, now()), rotated: true };
 		}
-		return applyActiveKey(config, ctx.modelRegistry);
+		return { keyName: applyActiveKey(config, ctx.modelRegistry, now()), rotated: false };
 	}
 
 	function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort">): void {
 		config = loadConfig();
 		if (!config.watchdogEnabled) return;
 		stopWatchdog();
-		watchdogAbortPending = false;
-		watchdogAbortMessage = undefined;
+		resetWatchdogAbortState();
 		const idleMs = getWatchdogIdleMs(config);
 		watchdog = new ProviderIdleWatchdog({
 			idleMs,
 			onTimeout: () => {
-				const keyName = rotateForWatchdog(ctx);
+				const timeoutInfo = watchdog?.currentTimeoutInfo() ?? {
+					phase: "waiting-for-response",
+					idleMs,
+					elapsedMs: idleMs,
+					idleForMs: idleMs,
+				};
+				const previousKey = config.keys[config.activeKeyIndex]?.name;
+				const rotation = rotateForWatchdog(ctx, timeoutInfo, watchdogRateLimitRotated);
+				watchdogTimeoutInfo = timeoutInfo;
+				recordWatchdogEvent({
+					time: now(),
+					keyName: previousKey,
+					rotatedTo: rotation.rotated ? rotation.keyName : undefined,
+					activeKey: rotation.keyName,
+					...timeoutInfo,
+				});
 				watchdogAbortPending = true;
-				watchdogAbortMessage = keyName
-					? `OpenCode Go timeout: no provider activity for ${Math.ceil(idleMs / 1000)}s; rotated to ${keyName}; retrying.`
-					: `OpenCode Go timeout: no provider activity for ${Math.ceil(idleMs / 1000)}s; no other key available.`;
-				ctx.ui.notify(watchdogAbortMessage, keyName ? "info" : "warning");
+				watchdogAbortMessage = rotation.keyName
+					? `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; ${rotation.rotated ? "rotated to" : "using"} ${rotation.keyName}; retrying.`
+					: `OpenCode Go timeout: ${formatTimeoutInfo(timeoutInfo)}; no other key available.`;
+				ctx.ui.notify(watchdogAbortMessage, rotation.keyName ? "info" : "warning");
 				ctx.abort();
 			},
+			timers: options.timers,
+			clock: options.clock,
 		});
 		watchdog.start();
 	}
@@ -260,25 +422,26 @@ export default function (pi: ExtensionAPI) {
 		config = loadConfig();
 		// On reload: re-apply active key, skip auto-import
 		if (event.reason === "reload") {
-			const keyName = applyActiveKey(config, ctx.modelRegistry);
+			const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 			if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
 			return;
 		}
 		if (config.keys.length === 0) {
 			if (await autoImportFromAuth(ctx)) {
-				ctx.ui.notify(`OpenCode: Imported key from auth.json → ${applyActiveKey(config, ctx.modelRegistry)}`, "info");
+				ctx.ui.notify(`OpenCode: Imported key from auth.json → ${applyActiveKey(config, ctx.modelRegistry, now())}`, "info");
 			} else {
 				ctx.ui.notify("OpenCode: No keys configured. Use /opencode add <name> <key>", "warning");
 				return;
 			}
 		}
-		const keyName = applyActiveKey(config, ctx.modelRegistry);
+		const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 		if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
 	});
 
 	pi.on("before_provider_request", (_event, ctx) => {
 		if (!shouldWatchProvider(ctx.model?.provider)) {
 			stopWatchdog();
+			resetWatchdogAbortState();
 			return;
 		}
 		startWatchdog(ctx);
@@ -287,18 +450,17 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_update", (event) => {
 		const message = event.message;
 		if (message.role !== "assistant" || !shouldWatchProvider(message.provider)) return;
-		watchdog?.activity();
+		watchdog?.streamActivity();
 	});
 
 	pi.on("message_end", async (event, ctx) => {
 		const message = event.message;
 		if (message.role !== "assistant" || message.provider !== PROVIDER) return;
 
-		const watchdogTimedOut = stopWatchdog();
-		if (watchdogTimedOut || watchdogAbortPending) {
-			const errorMessage = watchdogAbortMessage ?? "OpenCode Go timeout: no provider activity; retrying.";
-			watchdogAbortPending = false;
-			watchdogAbortMessage = undefined;
+		const timeoutInfo = stopWatchdog() ?? watchdogTimeoutInfo;
+		if (timeoutInfo || watchdogAbortPending) {
+			const errorMessage = watchdogAbortMessage ?? `OpenCode Go timeout: ${timeoutInfo ? formatTimeoutInfo(timeoutInfo) : "no provider activity"}; retrying.`;
+			resetWatchdogAbortState();
 			return {
 				message: {
 					...message,
@@ -318,12 +480,12 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Deduplicate with after_provider_response handler
-		const now = Date.now();
-		if (now - lastRotationTime < ROTATION_DEDUP_MS) return;
-		lastRotationTime = now;
+		const currentTime = now();
+		if (currentTime - lastRotationTime < ROTATION_DEDUP_MS) return;
+		lastRotationTime = currentTime;
 
-		const newIndex = rotateToNextKey(config);
-		const keyName = applyActiveKey(config, ctx.modelRegistry);
+		const newIndex = rotateToNextKey(config, { now: currentTime });
+		const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
 		ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
 	});
 
@@ -331,19 +493,20 @@ export default function (pi: ExtensionAPI) {
 	// This is faster than waiting for message_end error parsing.
 	pi.on("after_provider_response", (event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER) return;
-		watchdog?.activity();
+		watchdog?.response(event.status);
 		if (event.status !== 429) return;
-
 		config = loadConfig();
 		if (config.keys.length <= 1) return; // nothing to rotate to
 
-		// Deduplicate with message_end handler
-		const now = Date.now();
-		if (now - lastRotationTime < ROTATION_DEDUP_MS) return;
-		lastRotationTime = now;
+		// Deduplicate with message_end handler. If this returns, leave
+		// watchdogRateLimitRotated false so a later 429-body hang can still rotate.
+		const currentTime = now();
+		if (currentTime - lastRotationTime < ROTATION_DEDUP_MS) return;
+		lastRotationTime = currentTime;
 
-		const newIndex = rotateToNextKey(config);
-		const keyName = applyActiveKey(config, ctx.modelRegistry);
+		const newIndex = rotateToNextKey(config, { now: currentTime });
+		watchdogRateLimitRotated = true;
+		const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
 		ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
 	});
 
@@ -358,12 +521,18 @@ export default function (pi: ExtensionAPI) {
 				case "status":
 				case "list":
 				case "ls": {
-					const status = formatStatus(config);
+					const status = formatStatus(config, now());
 					if (config.keys.length === 0) {
 						ctx.ui.notify(`${status}\nUsing auth.json key (no rotation). Add keys with /opencode add.`, "info");
 					} else {
 						ctx.ui.notify(status, "info");
 					}
+					break;
+				}
+
+				case "events":
+				case "timeouts": {
+					ctx.ui.notify(formatWatchdogEvents(watchdogEvents, now()), "info");
 					break;
 				}
 
@@ -376,7 +545,7 @@ export default function (pi: ExtensionAPI) {
 					config.activeKeyIndex = targetIndex;
 					delete config.cooldowns[targetIndex];
 					saveConfig(config);
-					const keyName = applyActiveKey(config, ctx.modelRegistry);
+					const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 					ctx.ui.notify(`Switched to ${keyName}`, "info");
 					break;
 				}
@@ -389,7 +558,7 @@ export default function (pi: ExtensionAPI) {
 					config.activeKeyIndex = (config.activeKeyIndex + 1) % config.keys.length;
 					delete config.cooldowns[config.activeKeyIndex];
 					saveConfig(config);
-					const keyName = applyActiveKey(config, ctx.modelRegistry);
+					const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 					ctx.ui.notify(`Switched to ${keyName}`, "info");
 					break;
 				}
@@ -405,7 +574,7 @@ export default function (pi: ExtensionAPI) {
 					saveConfig(config);
 					if (config.keys.length === 1) {
 						config.activeKeyIndex = 0;
-						applyActiveKey(config, ctx.modelRegistry);
+						applyActiveKey(config, ctx.modelRegistry, now());
 					}
 					ctx.ui.notify(`Added "${name}" (${config.keys.length} keys)`, "info");
 					break;
@@ -434,7 +603,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					saveConfig(config);
 					if (config.keys.length > 0) {
-						applyActiveKey(config, ctx.modelRegistry);
+						applyActiveKey(config, ctx.modelRegistry, now());
 					} else {
 						ctx.modelRegistry.authStorage.removeRuntimeApiKey(PROVIDER);
 					}
@@ -463,7 +632,8 @@ export default function (pi: ExtensionAPI) {
 				case "watchdog": {
 					const value = parts[1];
 					if (!value || value === "status") {
-						ctx.ui.notify(`Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`, "info");
+						const events = formatWatchdogEvents(watchdogEvents, now());
+						ctx.ui.notify(`Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)\n${events}`, "info");
 						return;
 					}
 					if (value === "on") {
@@ -476,6 +646,7 @@ export default function (pi: ExtensionAPI) {
 						config.watchdogEnabled = false;
 						saveConfig(config);
 						stopWatchdog();
+						resetWatchdogAbortState();
 						ctx.ui.notify("Watchdog disabled", "info");
 						return;
 					}
@@ -493,7 +664,7 @@ export default function (pi: ExtensionAPI) {
 
 				default:
 					ctx.ui.notify(
-						"Usage: /opencode [status|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
+						"Usage: /opencode [status|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
 						"info",
 					);
 			}
@@ -502,12 +673,16 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_end", () => {
 		stopWatchdog();
-		watchdogAbortPending = false;
-		watchdogAbortMessage = undefined;
+		resetWatchdogAbortState();
 	});
 
 	pi.on("session_shutdown", async () => {
 		stopWatchdog();
+		resetWatchdogAbortState();
 		saveConfig(config);
 	});
+	};
 }
+
+const extension = createOpencodeGoRotationExtension();
+export default extension;
