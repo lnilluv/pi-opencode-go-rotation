@@ -250,15 +250,30 @@ function rotateToNextKey(config: Config, options: RotateOptions = {}): number {
 }
 
 
+interface RuntimeKeyStore {
+	setRuntimeApiKey(provider: string, key: string): void | Promise<void>;
+	removeRuntimeApiKey(provider: string): void | Promise<void>;
+}
+
+function getRuntimeKeyStore(modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }): RuntimeKeyStore {
+	const store = modelRegistry.authStorage ?? modelRegistry.runtime;
+	if (!store) throw new Error("Model registry does not expose runtime API key storage");
+	return store;
+}
+
+function ignoreAsyncRefresh(result: void | Promise<void>): void {
+	void result?.catch(() => {});
+}
+
 /** Set the active key as runtime override (highest priority in auth chain). */
-function applyActiveKey(config: Config, modelRegistry: { authStorage: { setRuntimeApiKey: (provider: string, key: string) => void } }, now = Date.now()): string | undefined {
+function applyActiveKey(config: Config, modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }, now = Date.now()): string | undefined {
 	const idx = pickAvailableKeyIndex(config, now);
 	if (idx === undefined) return undefined;
 	if (config.activeKeyIndex !== idx) {
 		config.activeKeyIndex = idx;
 		saveConfig(config);
 	}
-	modelRegistry.authStorage.setRuntimeApiKey(PROVIDER, config.keys[idx].key);
+	ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntimeApiKey(PROVIDER, config.keys[idx].key));
 	return config.keys[idx].name || `key-${idx + 1}`;
 }
 
@@ -605,7 +620,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					if (config.keys.length > 0) {
 						applyActiveKey(config, ctx.modelRegistry, now());
 					} else {
-						ctx.modelRegistry.authStorage.removeRuntimeApiKey(PROVIDER);
+						ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntimeApiKey(PROVIDER));
 					}
 					ctx.ui.notify(`Removed "${removed.name}" (${config.keys.length} left)`, "info");
 					break;
