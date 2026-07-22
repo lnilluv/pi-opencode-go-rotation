@@ -84,19 +84,20 @@ interface FakeContextState {
 	aborts: number;
 }
 
-function createContext(state: FakeContextState): ExtensionContext {
+function createContext(state: FakeContextState, registryShape: "authStorage" | "runtime" = "authStorage"): ExtensionContext {
+	const keyStore = {
+		setRuntimeApiKey: (_provider: string, key: string) => {
+			state.runtimeKeys.push(key);
+		},
+		removeRuntimeApiKey: (_provider: string) => {
+			state.runtimeKeys.push("removed");
+		},
+	};
 	const context = {
 		model: { provider: "opencode-go" },
 		modelRegistry: {
 			getApiKeyForProvider: async () => undefined,
-			authStorage: {
-				setRuntimeApiKey: (_provider: string, key: string) => {
-					state.runtimeKeys.push(key);
-				},
-				removeRuntimeApiKey: (_provider: string) => {
-					state.runtimeKeys.push("removed");
-				},
-			},
+			[registryShape]: keyStore,
 		},
 		ui: {
 			notify: (message: string) => {
@@ -142,16 +143,26 @@ function withTempConfig(run: (configPath: string) => Promise<void>): Promise<voi
 	});
 }
 
-function createHarness(): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
+function createHarness(registryShape: "authStorage" | "runtime" = "authStorage"): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
 	const timers = new FakeTimers();
 	const clock = new FakeClock();
 	const pi = new FakePi();
 	const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0 };
-	const ctx = createContext(state);
+	const ctx = createContext(state, registryShape);
 	const extension = createOpencodeGoRotationExtension({ timers, clock });
 	extension(pi as unknown as ExtensionAPI);
 	return { pi, ctx, state, timers, clock };
 }
+
+test("session start supports the current model registry runtime store", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness("runtime");
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+	});
+});
 
 test("hook replay aborts a no-response hang and rotates", async () => {
 	await withTempConfig(async () => {
