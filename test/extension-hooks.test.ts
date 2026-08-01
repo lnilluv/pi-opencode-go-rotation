@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -183,6 +183,42 @@ test("hook replay aborts a no-response hang and rotates", async () => {
 	});
 });
 
+test("late 429 after a watchdog rotation does not rotate a second key", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(90_000);
+		timers.fireAll();
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+
+		clock.advance(6_000);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("disabling the watchdog clears a stale timeout guard", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state, timers, clock } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(90_000);
+		timers.fireAll();
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+
+		await pi.runCommand("opencode", "watchdog off", ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		clock.advance(6_000);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+	});
+});
+
 test("hook replay reuses the 429-rotated key when the 429 body hangs", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state, timers, clock } = createHarness();
@@ -227,5 +263,74 @@ test("hook replay rotates on a dedup-suppressed second 429 hang", async () => {
 		assert.deepEqual(state.runtimeKeys.at(-1), "sk-three");
 		assert.match(JSON.stringify(result), /last HTTP 429/);
 		assert.match(JSON.stringify(result), /rotated to three/);
+	});
+});
+
+test("fixed-window quota errors pause automatic rotation until manual selection", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+		const quotaError = "You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z";
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: quotaError },
+		}, ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		assert.match(state.notifications.join("\n"), /automatic key rotation paused/);
+
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+
+		await pi.runCommand("opencode", "next", ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("a successful provider message resumes automatic rotation after a quota hold", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("message_end", {
+			message: {
+				role: "assistant",
+				provider: "opencode-go",
+				stopReason: "error",
+				errorMessage: "You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z",
+			},
+		}, ctx);
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "stop", errorMessage: "" },
+		}, ctx);
+
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("status shows key names without exposing key material", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "status", ctx);
+
+		const status = state.notifications.at(-1) ?? "";
+		assert.match(status, /one/);
+		assert.match(status, /two/);
+		assert.doesNotMatch(status, /sk-one|sk-two|sk-three/);
+	});
+});
+
+test("config writes restore private file permissions", async () => {
+	await withTempConfig(async (configPath) => {
+		chmodSync(configPath, 0o644);
+		const { pi, ctx } = createHarness();
+
+		await pi.runCommand("opencode", "reset", ctx);
+
+		assert.equal(statSync(configPath).mode & 0o777, 0o600);
 	});
 });

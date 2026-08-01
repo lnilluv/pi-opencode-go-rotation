@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -7,7 +7,8 @@ const PROVIDER = "opencode-go";
 const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 const DEFAULT_COOLDOWN_MINUTES = 60;
 const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
-const QUOTA_ERROR_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
+const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
+const TRANSIENT_RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
 const ROTATION_DEDUP_MS = 5_000;
 
 
@@ -56,6 +57,7 @@ function saveConfig(config: Config): void {
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 	writeFileSync(path, JSON.stringify(config, null, 2), { mode: 0o600 });
+	chmodSync(path, 0o600);
 }
 
 function getCooldownMs(config: Config): number {
@@ -68,6 +70,14 @@ function getWatchdogIdleMs(config: Config): number {
 
 export function shouldWatchProvider(provider: string | undefined): boolean {
 	return provider === PROVIDER;
+}
+
+export type RateLimitKind = "transient" | "fixed-window-quota";
+
+export function classifyRateLimitError(message: string): RateLimitKind | undefined {
+	if (FIXED_WINDOW_QUOTA_RE.test(message)) return "fixed-window-quota";
+	if (TRANSIENT_RATE_LIMIT_RE.test(message)) return "transient";
+	return undefined;
 }
 
 export interface TimerApi {
@@ -291,7 +301,7 @@ function formatStatus(config: Config, now = Date.now()): string {
 			const remaining = cdMs - (now - cooldownStart);
 			if (remaining > 0) tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
 		}
-		return `${marker} ${i + 1}. ${key.name} (${key.key.slice(0, 8)}...)${tag}`;
+		return `${marker} ${i + 1}. ${key.name}${tag}`;
 	}).join("\n")}\n${watchdogStatus}`;
 }
 
@@ -348,11 +358,34 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		let watchdogAbortMessage: string | undefined;
 		let watchdogTimeoutInfo: ProviderTimeoutInfo | undefined;
 		let watchdogRateLimitRotated = false;
-		/** Timestamp of the last surfaced-error key rotation for this extension instance. */
+		let watchdogRequestTimedOut = false;
+		/** Timestamp of the last key rotation for this extension instance. */
 		let lastRotationTime = Number.NEGATIVE_INFINITY;
+		let fixedWindowQuotaActive = false;
 		const watchdogEvents: WatchdogEvent[] = [];
 
 		const now = (): number => options.clock?.now() ?? Date.now();
+
+	function recordRotation(rotationTime: number): void {
+		lastRotationTime = rotationTime;
+	}
+
+	function isRotationDeduplicated(rotationTime: number): boolean {
+		return rotationTime - lastRotationTime < ROTATION_DEDUP_MS;
+	}
+
+	function pauseAutomaticRotation(ctx: Pick<ExtensionContext, "ui">): void {
+		if (fixedWindowQuotaActive) return;
+		fixedWindowQuotaActive = true;
+		ctx.ui.notify(
+			"OpenCode: Go plan quota window exhausted; automatic key rotation paused to avoid cycling keys on the same workspace. Use /opencode next or /opencode use <n> to try an independent key manually.",
+			"warning",
+		);
+	}
+
+	function resumeAutomaticRotation(): void {
+		fixedWindowQuotaActive = false;
+	}
 
 
 
@@ -370,6 +403,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		watchdogRateLimitRotated = false;
 	}
 
+	function clearWatchdogTimeoutGuard(): void {
+		watchdogRequestTimedOut = false;
+	}
+
 	function recordWatchdogEvent(event: WatchdogEvent): void {
 		watchdogEvents.push(event);
 		while (watchdogEvents.length > 10) watchdogEvents.shift();
@@ -377,16 +414,22 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 	function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): { keyName?: string; rotated: boolean } {
 		config = loadConfig();
+		const currentTime = now();
 		if (config.keys.length <= 1) return { rotated: false };
-		if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
-			rotateToNextKey(config, { now: now() });
-			return { keyName: applyActiveKey(config, ctx.modelRegistry, now()), rotated: true };
+		if (fixedWindowQuotaActive) {
+			return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
 		}
-		return { keyName: applyActiveKey(config, ctx.modelRegistry, now()), rotated: false };
+		if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
+			rotateToNextKey(config, { now: currentTime });
+			recordRotation(currentTime);
+			return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: true };
+		}
+		return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
 	}
 
 	function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort">): void {
 		config = loadConfig();
+		clearWatchdogTimeoutGuard();
 		if (!config.watchdogEnabled) return;
 		stopWatchdog();
 		resetWatchdogAbortState();
@@ -394,6 +437,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		watchdog = new ProviderIdleWatchdog({
 			idleMs,
 			onTimeout: () => {
+				watchdogRequestTimedOut = true;
 				const timeoutInfo = watchdog?.currentTimeoutInfo() ?? {
 					phase: "waiting-for-response",
 					idleMs,
@@ -435,6 +479,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 	pi.on("session_start", async (event, ctx) => {
 		config = loadConfig();
+		clearWatchdogTimeoutGuard();
 		// On reload: re-apply active key, skip auto-import
 		if (event.reason === "reload") {
 			const keyName = applyActiveKey(config, ctx.modelRegistry, now());
@@ -457,6 +502,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		if (!shouldWatchProvider(ctx.model?.provider)) {
 			stopWatchdog();
 			resetWatchdogAbortState();
+			clearWatchdogTimeoutGuard();
 			return;
 		}
 		startWatchdog(ctx);
@@ -485,8 +531,17 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			};
 		}
 
-		if (message.stopReason !== "error") return;
-		if (!QUOTA_ERROR_RE.test(message.errorMessage ?? "")) return;
+		if (message.stopReason !== "error") {
+			resumeAutomaticRotation();
+			return;
+		}
+		const rateLimitKind = classifyRateLimitError(message.errorMessage ?? "");
+		if (!rateLimitKind) return;
+		if (rateLimitKind === "fixed-window-quota") {
+			pauseAutomaticRotation(ctx);
+			return;
+		}
+		if (fixedWindowQuotaActive) return;
 
 		config = loadConfig();
 		if (config.keys.length <= 1) {
@@ -496,8 +551,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 		// Deduplicate with after_provider_response handler
 		const currentTime = now();
-		if (currentTime - lastRotationTime < ROTATION_DEDUP_MS) return;
-		lastRotationTime = currentTime;
+		if (isRotationDeduplicated(currentTime)) return;
+		recordRotation(currentTime);
 
 		const newIndex = rotateToNextKey(config, { now: currentTime });
 		const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
@@ -510,14 +565,16 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		if (ctx.model?.provider !== PROVIDER) return;
 		watchdog?.response(event.status);
 		if (event.status !== 429) return;
+		if (watchdogRequestTimedOut) return;
+		if (fixedWindowQuotaActive) return;
 		config = loadConfig();
 		if (config.keys.length <= 1) return; // nothing to rotate to
 
 		// Deduplicate with message_end handler. If this returns, leave
 		// watchdogRateLimitRotated false so a later 429-body hang can still rotate.
 		const currentTime = now();
-		if (currentTime - lastRotationTime < ROTATION_DEDUP_MS) return;
-		lastRotationTime = currentTime;
+		if (isRotationDeduplicated(currentTime)) return;
+		recordRotation(currentTime);
 
 		const newIndex = rotateToNextKey(config, { now: currentTime });
 		watchdogRateLimitRotated = true;
@@ -557,6 +614,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify(`Invalid index. Use 1-${config.keys.length}.`, "warning");
 						return;
 					}
+					resumeAutomaticRotation();
 					config.activeKeyIndex = targetIndex;
 					delete config.cooldowns[targetIndex];
 					saveConfig(config);
@@ -570,6 +628,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify("No keys configured. Use /opencode add <name> <key>.", "warning");
 						return;
 					}
+					resumeAutomaticRotation();
 					config.activeKeyIndex = (config.activeKeyIndex + 1) % config.keys.length;
 					delete config.cooldowns[config.activeKeyIndex];
 					saveConfig(config);
@@ -585,6 +644,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify("Usage: /opencode add <name> <key>", "warning");
 						return;
 					}
+					resumeAutomaticRotation();
 					config.keys.push({ name, key });
 					saveConfig(config);
 					if (config.keys.length === 1) {
@@ -602,6 +662,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify(`Invalid index. Use 1-${config.keys.length}.`, "warning");
 						return;
 					}
+					resumeAutomaticRotation();
 					const removed = config.keys.splice(removeIndex, 1)[0];
 					delete config.cooldowns[removeIndex];
 					// Reindex cooldowns after removal
@@ -627,6 +688,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				}
 
 				case "reset":
+					resumeAutomaticRotation();
 					config.cooldowns = {};
 					saveConfig(config);
 					ctx.ui.notify("All cooldowns cleared", "info");
@@ -689,11 +751,13 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 	pi.on("agent_end", () => {
 		stopWatchdog();
 		resetWatchdogAbortState();
+		clearWatchdogTimeoutGuard();
 	});
 
 	pi.on("session_shutdown", async () => {
 		stopWatchdog();
 		resetWatchdogAbortState();
+		clearWatchdogTimeoutGuard();
 		saveConfig(config);
 	});
 	};
