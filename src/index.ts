@@ -594,11 +594,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				case "list":
 				case "ls": {
 					const status = formatStatus(config, now());
-					if (config.keys.length === 0) {
-						ctx.ui.notify(`${status}\nUsing auth.json key (no rotation). Add keys with /opencode add.`, "info");
-					} else {
-						ctx.ui.notify(status, "info");
-					}
+					ctx.ui.notify(status, "info");
 					break;
 				}
 

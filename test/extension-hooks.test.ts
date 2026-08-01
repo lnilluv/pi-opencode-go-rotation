@@ -324,6 +324,19 @@ test("status shows key names without exposing key material", async () => {
 	});
 });
 
+test("status does not claim an auth key when none is configured", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [] }), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "status", ctx);
+
+		const status = state.notifications.at(-1) ?? "";
+		assert.match(status, /No keys configured/);
+		assert.doesNotMatch(status, /Using auth\.json key/);
+	});
+});
+
 test("config writes restore private file permissions", async () => {
 	await withTempConfig(async (configPath) => {
 		chmodSync(configPath, 0o644);
