@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ProviderIdleWatchdog, shouldRotateAfterWatchdogTimeout, shouldWatchProvider } from "../src/index.ts";
+import { ProviderIdleWatchdog, classifyRateLimitError, shouldRotateAfterWatchdogTimeout, shouldWatchProvider } from "../src/index.ts";
 
 class FakeTimers {
 	private nextId = 1;
@@ -42,6 +42,15 @@ test("shouldWatchProvider only enables the watchdog for opencode-go", () => {
 	assert.equal(shouldWatchProvider("opencode-go"), true);
 	assert.equal(shouldWatchProvider("anthropic"), false);
 	assert.equal(shouldWatchProvider(undefined), false);
+});
+
+test("classifyRateLimitError distinguishes fixed-window quota errors from transient limits", () => {
+	assert.equal(
+		classifyRateLimitError("You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z"),
+		"fixed-window-quota",
+	);
+	assert.equal(classifyRateLimitError("429 rate limit"), "transient");
+	assert.equal(classifyRateLimitError("provider unavailable"), undefined);
 });
 
 test("shouldRotateAfterWatchdogTimeout reuses the already-rotated key after a 429", () => {
@@ -197,4 +206,3 @@ test("ProviderIdleWatchdog reports stream activity stalls separately", () => {
 	assert.equal(info?.elapsedMs, 93_000);
 	assert.equal(info?.idleForMs, 90_000);
 });
-
