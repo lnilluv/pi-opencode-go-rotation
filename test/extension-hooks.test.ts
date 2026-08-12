@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { FetchApi, OpenCodeGoUsageWindowStatus } from "../src/index.ts";
+import type { FetchApi, OpenCodeGoUsageWindow } from "../src/index.ts";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -185,8 +185,12 @@ function createHarness(registryShape: "authStorage" | "runtime" = "authStorage",
 }
 
 test("usage helpers parse the upstream response shape", () => {
-	const activeStatus: OpenCodeGoUsageWindowStatus = "active";
-	assert.equal(activeStatus, "active");
+	const rollingWindow = {
+		name: "rolling",
+		status: "active",
+		usagePercent: 12,
+		resetAt: "2026-08-13T00:00:00Z",
+	} satisfies OpenCodeGoUsageWindow;
 	assert.deepEqual(parseOpenCodeGoUsage({
 		usage: {
 			rolling: { status: "ok", percent: 12, resetsAt: "2026-08-13T00:00:00Z" },
@@ -194,7 +198,7 @@ test("usage helpers parse the upstream response shape", () => {
 		},
 	}), {
 		windows: [
-			{ name: "rolling", status: "active", usagePercent: 12, resetAt: "2026-08-13T00:00:00Z" },
+			rollingWindow,
 			{ name: "weekly", status: "rate-limited", usagePercent: 100, resetAt: "2026-08-19T00:00:00Z" },
 		],
 	});
@@ -300,6 +304,7 @@ test("hook replay keeps the rapid-retry rotation when the second 429 hangs", asy
 		const { pi, ctx, state, timers, clock } = createHarness();
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 rate limit" },
 		}, ctx);
@@ -342,6 +347,7 @@ test("fixed-window quota errors block the failed key and rotate automatically", 
 		const quotaError = "You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z";
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: quotaError },
 		}, ctx);
@@ -355,6 +361,7 @@ test("fixed-window quota errors fall back to the cooldown when no reset is parse
 		const { pi, ctx, state } = createHarness();
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: {
 				role: "assistant",
@@ -391,7 +398,90 @@ test("response quota rotation and message_end cannot rotate twice", async () => 
 		}, ctx);
 
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
-		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000 });
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": Date.parse("2026-08-01T12:00:00Z") });
+	});
+});
+
+test("one transient 429 request cannot rotate twice after the old dedup window", async () => {
+	await withTempConfig(async () => {
+		const fetch: FetchApi = async () => ({ ok: false, status: 503, json: async () => ({}) });
+		const { pi, ctx, state, clock } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		clock.advance(6_000);
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 rate limit" },
+		}, ctx);
+
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+	});
+});
+
+test("a fixed-window message upgrades a transient response rotation without rotating again", async () => {
+	await withTempConfig(async (configPath) => {
+		const fetch: FetchApi = async () => ({ ok: false, status: 503, json: async () => ({}) });
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+		const reset = Date.parse("2026-08-01T12:00:00Z");
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		await pi.emit("message_end", {
+			message: {
+				role: "assistant",
+				provider: "opencode-go",
+				stopReason: "error",
+				errorMessage: "You have exceeded the weekly usage quota. It will reset at 2026-08-01T12:00:00Z",
+			},
+		}, ctx);
+
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], reset);
+	});
+});
+
+test("an authoritative message reset replaces a longer usage fallback", async () => {
+	await withTempConfig(async (configPath) => {
+		const fetch: FetchApi = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited" }] }),
+		});
+		const { pi, ctx } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 3_600_000);
+
+		await pi.emit("message_end", {
+			message: {
+				role: "assistant",
+				provider: "opencode-go",
+				stopReason: "error",
+				errorMessage: "You have exceeded the weekly usage quota. It will reset at 1970-01-01T00:30:00Z",
+			},
+		}, ctx);
+
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 1_800_000);
+	});
+});
+
+test("an unmatched 429 response cannot rotate after another provider request starts", async () => {
+	await withTempConfig(async (configPath) => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		Object.assign(ctx, { model: { provider: "deepseek", baseUrl: "https://api.deepseek.com" } });
+		await pi.emit("before_provider_request", {}, ctx);
+		Object.assign(ctx, { model: { provider: "opencode-go", baseUrl: "https://example.test/opencode" } });
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+		assert.deepEqual(readConfig(configPath).cooldowns, {});
 	});
 });
 
@@ -422,7 +512,7 @@ test("sequential quota failures try each key once and then stop", async () => {
 		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {
 			"0": 3_600_000,
 			"1": 3_600_000,
-			"2": 3_600_000,
+			"2": Date.parse("2026-08-01T12:00:00Z"),
 		});
 		assert.match(state.notifications.join("\n"), /all configured keys.*quota-blocked/i);
 		assert.equal(state.notifications.filter((message) => /all configured keys.*quota-blocked/i.test(message)).length, 1);
@@ -440,6 +530,7 @@ test("transient all-cooldown fallback skips active quota blocks", async () => {
 		const { pi, ctx, state } = createHarness();
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 rate limit" },
 		}, ctx);
@@ -689,6 +780,7 @@ test("http 429 preserves transient rotation when usage endpoint is unavailable",
 		const { pi, ctx, state, clock } = createHarness("authStorage", async () => ({ ok: false, status: 404, json: async () => ({}) }));
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
 		clock.advance(6_000);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 
