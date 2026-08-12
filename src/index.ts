@@ -397,12 +397,21 @@ function parseOpenCodeGoUsageWindow(value: unknown): OpenCodeGoUsageWindow | und
 }
 
 export function parseOpenCodeGoUsage(value: unknown): OpenCodeGoUsageResponse | undefined {
-	if (!isRecord(value) || !Array.isArray(value.windows)) return undefined;
+	if (!isRecord(value)) return undefined;
 	const windows: OpenCodeGoUsageWindow[] = [];
-	for (const window of value.windows) {
+	if (Array.isArray(value.windows)) {
+		for (const window of value.windows) {
+			const parsed = parseOpenCodeGoUsageWindow(window);
+			if (!parsed) return undefined;
+			windows.push(parsed);
+		}
+		return { windows };
+	}
+	if (!isRecord(value.usage)) return undefined;
+	for (const [name, window] of Object.entries(value.usage)) {
 		const parsed = parseOpenCodeGoUsageWindow(window);
 		if (!parsed) return undefined;
-		windows.push(parsed);
+		windows.push(parsed.name === undefined ? { ...parsed, name } : parsed);
 	}
 	return { windows };
 }

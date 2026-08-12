@@ -167,6 +167,17 @@ test("usage helpers parse the upstream response shape", () => {
 	const activeStatus: OpenCodeGoUsageWindowStatus = "active";
 	assert.equal(activeStatus, "active");
 	assert.deepEqual(parseOpenCodeGoUsage({
+		usage: {
+			rolling: { status: "ok", percent: 12, resetsAt: "2026-08-13T00:00:00Z" },
+			weekly: { status: "rate-limited", percent: 100, resetsAt: "2026-08-19T00:00:00Z" },
+		},
+	}), {
+		windows: [
+			{ name: "rolling", status: "active", usagePercent: 12, resetAt: "2026-08-13T00:00:00Z" },
+			{ name: "weekly", status: "rate-limited", usagePercent: 100, resetAt: "2026-08-19T00:00:00Z" },
+		],
+	});
+	assert.deepEqual(parseOpenCodeGoUsage({
 		plan: "lite",
 		useBalance: true,
 		windows: [{ name: "5-hour", status: "ok", usagePercent: 70, resetInSec: 8_100, used: 8.4, limit: 12 }],
