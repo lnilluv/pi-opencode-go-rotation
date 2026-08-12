@@ -7,6 +7,8 @@ const PROVIDER = "opencode-go";
 const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
 const DEFAULT_COOLDOWN_MINUTES = 60;
 const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
+const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
+const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
 const TRANSIENT_RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
 const ROTATION_DEDUP_MS = 5_000;
@@ -109,9 +111,58 @@ export interface ClockApi {
 	now(): number;
 }
 
+export interface FetchResponseApi {
+	ok: boolean;
+	status: number;
+	json(): Promise<unknown>;
+}
+
+export type FetchApi = (url: string, init: { method: "GET"; headers: Record<string, string>; signal?: AbortSignal }) => Promise<FetchResponseApi>;
+
 export interface ExtensionOptions {
 	timers?: TimerApi;
 	clock?: ClockApi;
+	fetch?: FetchApi;
+}
+
+export type OpenCodeGoUsageWindowStatus = "active" | "rate-limited" | "unknown";
+
+export interface OpenCodeGoUsageWindow {
+	name?: string;
+	status: OpenCodeGoUsageWindowStatus;
+	usagePercent?: number;
+	resetInSec?: number;
+	used?: number;
+	limit?: number;
+	remaining?: number;
+	resetAt?: string;
+	startAt?: string;
+	endAt?: string;
+}
+
+export interface OpenCodeGoUsageResponse {
+	windows: OpenCodeGoUsageWindow[];
+}
+
+type UsageFetchResult = {
+	ok: true;
+	keyName: string;
+	usage: OpenCodeGoUsageResponse;
+} | {
+	ok: false;
+	keyName?: string;
+	message: string;
+};
+
+interface UsageLookupTarget {
+	readonly keyIndex: number;
+	readonly keyName: string;
+	readonly bearerToken: string;
+}
+
+interface UsageDecisionIdentity {
+	readonly epoch: number;
+	readonly target: UsageLookupTarget;
 }
 
 
@@ -287,6 +338,175 @@ function applyActiveKey(config: Config, modelRegistry: { authStorage?: RuntimeKe
 	return config.keys[idx].name || `key-${idx + 1}`;
 }
 
+function getActiveUsageTarget(config: Config): UsageLookupTarget | undefined {
+	const entry = config.keys[config.activeKeyIndex];
+	if (!entry) return undefined;
+	return {
+		keyIndex: config.activeKeyIndex,
+		keyName: entry.name || `key-${config.activeKeyIndex + 1}`,
+		bearerToken: entry.key,
+	};
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readString(record: Record<string, unknown>, keys: string[]): string | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string") return value;
+	}
+	return undefined;
+}
+
+function readNumber(record: Record<string, unknown>, keys: string[]): number | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "number" && Number.isFinite(value)) return value;
+	}
+	return undefined;
+}
+
+function parseOpenCodeGoUsageWindow(value: unknown): OpenCodeGoUsageWindow | undefined {
+	if (!isRecord(value)) return undefined;
+	const status: OpenCodeGoUsageWindowStatus = value.status === "ok" || value.status === "active"
+		? "active"
+		: value.status === "rate-limited" ? "rate-limited" : "unknown";
+	const name = readString(value, ["name", "window", "period", "label"]);
+	const usagePercent = readNumber(value, ["usagePercent", "usage_percent", "percent"]);
+	const resetInSec = readNumber(value, ["resetInSec", "reset_in_sec", "resetSeconds", "reset_seconds"]);
+	const used = readNumber(value, ["used", "usage", "usedTokens"]);
+	const limit = readNumber(value, ["limit", "quota", "total"]);
+	const remaining = readNumber(value, ["remaining", "remainingTokens"]);
+	const resetAt = readString(value, ["resetAt", "reset_at", "resetsAt", "resets_at"]);
+	const startAt = readString(value, ["startAt", "start_at", "startsAt", "starts_at"]);
+	const endAt = readString(value, ["endAt", "end_at", "endsAt", "ends_at"]);
+	return {
+		status,
+		...(name === undefined ? {} : { name }),
+		...(usagePercent === undefined ? {} : { usagePercent }),
+		...(resetInSec === undefined ? {} : { resetInSec }),
+		...(used === undefined ? {} : { used }),
+		...(limit === undefined ? {} : { limit }),
+		...(remaining === undefined ? {} : { remaining }),
+		...(resetAt === undefined ? {} : { resetAt }),
+		...(startAt === undefined ? {} : { startAt }),
+		...(endAt === undefined ? {} : { endAt }),
+	};
+}
+
+export function parseOpenCodeGoUsage(value: unknown): OpenCodeGoUsageResponse | undefined {
+	if (!isRecord(value) || !Array.isArray(value.windows)) return undefined;
+	const windows: OpenCodeGoUsageWindow[] = [];
+	for (const window of value.windows) {
+		const parsed = parseOpenCodeGoUsageWindow(window);
+		if (!parsed) return undefined;
+		windows.push(parsed);
+	}
+	return { windows };
+}
+
+async function fetchOpenCodeGoUsage(target: UsageLookupTarget | undefined, fetchApi: FetchApi, timers?: TimerApi): Promise<UsageFetchResult> {
+	if (!target) return { ok: false, message: "No OpenCode keys configured." };
+	const controller = new AbortController();
+	const timeoutFailure: UsageFetchResult = { ok: false, keyName: target.keyName, message: "Usage request timed out after 10s." };
+	const timerApi = timers ?? {
+		setTimeout: (callback, ms) => globalThis.setTimeout(callback, ms),
+		clearTimeout: (timer) => globalThis.clearTimeout(timer as Parameters<typeof globalThis.clearTimeout>[0]),
+	};
+	let didTimeout = false;
+	let timeout: unknown;
+	const request = (async (): Promise<UsageFetchResult> => {
+		try {
+			const response = await fetchApi(OPENCODE_GO_USAGE_URL, {
+				method: "GET",
+				headers: {
+					Accept: "application/json",
+					Authorization: `Bearer ${target.bearerToken}`,
+				},
+				signal: controller.signal,
+			});
+			if (!response.ok) {
+				return { ok: false, keyName: target.keyName, message: `Usage request failed with HTTP ${response.status}.` };
+			}
+			const usage = parseOpenCodeGoUsage(await response.json());
+			if (!usage) return { ok: false, keyName: target.keyName, message: "Usage response did not match the expected OpenCode Go shape." };
+			return { ok: true, keyName: target.keyName, usage };
+		} catch {
+			if (didTimeout) return timeoutFailure;
+			return { ok: false, keyName: target.keyName, message: "Usage request failed." };
+		}
+	})();
+	const timedOut = new Promise<UsageFetchResult>((resolve) => {
+		timeout = timerApi.setTimeout(() => {
+			didTimeout = true;
+			controller.abort();
+			resolve(timeoutFailure);
+		}, OPENCODE_GO_USAGE_TIMEOUT_MS);
+	});
+	try {
+		return await Promise.race([request, timedOut]);
+	} finally {
+		timerApi.clearTimeout(timeout);
+	}
+}
+
+function captureUsageDecision(config: Config, epoch: number): UsageDecisionIdentity | undefined {
+	const target = getActiveUsageTarget(config);
+	return target ? { epoch, target } : undefined;
+}
+
+function isCurrentUsageDecision(decision: UsageDecisionIdentity, config: Config, epoch: number): boolean {
+	const currentTarget = getActiveUsageTarget(config);
+	return epoch === decision.epoch
+		&& currentTarget?.keyIndex === decision.target.keyIndex
+		&& currentTarget.keyName === decision.target.keyName
+		&& currentTarget.bearerToken === decision.target.bearerToken;
+}
+
+function hasRateLimitedUsageWindow(result: UsageFetchResult): boolean {
+	return result.ok && result.usage.windows.some((window) => window.status === "rate-limited");
+}
+
+function formatUsageAmount(value: number | undefined): string | undefined {
+	return value === undefined ? undefined : value.toLocaleString("en-US");
+}
+
+export function formatResetIn(seconds: number): string {
+	if (seconds <= 0) return "now";
+	const days = Math.floor(seconds / 86_400);
+	const hours = Math.floor((seconds % 86_400) / 3_600);
+	const minutes = Math.ceil((seconds % 3_600) / 60);
+	if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+	if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+	return minutes > 0 ? `${minutes}m` : "less than 1m";
+}
+
+function formatUsageWindow(window: OpenCodeGoUsageWindow, index: number): string {
+	const label = window.name ?? `window ${index + 1}`;
+	const details = [`${label}: ${window.status}`];
+	const used = formatUsageAmount(window.used);
+	const limit = formatUsageAmount(window.limit);
+	const remaining = formatUsageAmount(window.remaining);
+	if (window.usagePercent !== undefined) details.push(`${Math.round(window.usagePercent)}% used`);
+	if (used !== undefined && limit !== undefined) details.push(`${used}/${limit} used`);
+	else if (used !== undefined) details.push(`${used} used`);
+	if (remaining !== undefined) details.push(`${remaining} remaining`);
+	if (window.resetInSec !== undefined) details.push(`resets in ${formatResetIn(window.resetInSec)}`);
+	else if (window.resetAt) details.push(`resets ${window.resetAt}`);
+	else if (window.endAt) details.push(`ends ${window.endAt}`);
+	return details.join("; ");
+}
+
+export function formatUsageStatus(result: UsageFetchResult): string {
+	if (!result.ok) {
+		return `OpenCode usage unavailable${result.keyName ? ` for ${result.keyName}` : ""}: ${result.message}`;
+	}
+	if (result.usage.windows.length === 0) return `OpenCode usage for ${result.keyName}: no usage windows returned.`;
+	return [`OpenCode usage for ${result.keyName}:`, ...result.usage.windows.map(formatUsageWindow)].join("\n");
+}
+
 function formatStatus(config: Config, now = Date.now()): string {
 	const watchdogStatus = `Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`;
 	if (config.keys.length === 0) {
@@ -362,13 +582,20 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		/** Timestamp of the last key rotation for this extension instance. */
 		let lastRotationTime = Number.NEGATIVE_INFINITY;
 		let fixedWindowQuotaActive = false;
+		let usageDecisionEpoch = 0;
 		const watchdogEvents: WatchdogEvent[] = [];
 
 		const now = (): number => options.clock?.now() ?? Date.now();
+		const fetchApi: FetchApi = options.fetch ?? globalThis.fetch.bind(globalThis);
 
-	function recordRotation(rotationTime: number): void {
-		lastRotationTime = rotationTime;
-	}
+		function invalidateAutomaticDecisions(): void {
+			usageDecisionEpoch++;
+		}
+
+		function recordRotation(rotationTime: number): void {
+			invalidateAutomaticDecisions();
+			lastRotationTime = rotationTime;
+		}
 
 	function isRotationDeduplicated(rotationTime: number): boolean {
 		return rotationTime - lastRotationTime < ROTATION_DEDUP_MS;
@@ -383,9 +610,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		);
 	}
 
-	function resumeAutomaticRotation(): void {
-		fixedWindowQuotaActive = false;
-	}
+		function resumeAutomaticRotation(): void {
+			invalidateAutomaticDecisions();
+			fixedWindowQuotaActive = false;
+		}
 
 
 
@@ -412,20 +640,20 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		while (watchdogEvents.length > 10) watchdogEvents.shift();
 	}
 
-	function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): { keyName?: string; rotated: boolean } {
-		config = loadConfig();
-		const currentTime = now();
-		if (config.keys.length <= 1) return { rotated: false };
-		if (fixedWindowQuotaActive) {
+		function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): { keyName?: string; rotated: boolean } {
+			config = loadConfig();
+			const currentTime = now();
+			if (config.keys.length <= 1) return { rotated: false };
+			if (fixedWindowQuotaActive) {
+				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
+			}
+			if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
+				rotateToNextKey(config, { now: currentTime });
+				recordRotation(currentTime);
+				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: true };
+			}
 			return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
 		}
-		if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
-			rotateToNextKey(config, { now: currentTime });
-			recordRotation(currentTime);
-			return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: true };
-		}
-		return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
-	}
 
 	function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort">): void {
 		config = loadConfig();
@@ -437,6 +665,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		watchdog = new ProviderIdleWatchdog({
 			idleMs,
 			onTimeout: () => {
+				invalidateAutomaticDecisions();
 				watchdogRequestTimedOut = true;
 				const timeoutInfo = watchdog?.currentTimeoutInfo() ?? {
 					phase: "waiting-for-response",
@@ -498,8 +727,9 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
 	});
 
-	pi.on("before_provider_request", (_event, ctx) => {
-		if (!shouldWatchProvider(ctx.model?.provider)) {
+		pi.on("before_provider_request", (_event, ctx) => {
+			invalidateAutomaticDecisions();
+			if (!shouldWatchProvider(ctx.model?.provider)) {
 			stopWatchdog();
 			resetWatchdogAbortState();
 			clearWatchdogTimeoutGuard();
@@ -549,7 +779,6 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			return;
 		}
 
-		// Deduplicate with after_provider_response handler
 		const currentTime = now();
 		if (isRotationDeduplicated(currentTime)) return;
 		recordRotation(currentTime);
@@ -559,19 +788,26 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
 	});
 
-	// Proactive rate-limit detection via HTTP status — fires before stream consumption.
-	// This is faster than waiting for message_end error parsing.
-	pi.on("after_provider_response", (event, ctx) => {
-		if (ctx.model?.provider !== PROVIDER) return;
-		watchdog?.response(event.status);
-		if (event.status !== 429) return;
-		if (watchdogRequestTimedOut) return;
-		if (fixedWindowQuotaActive) return;
-		config = loadConfig();
-		if (config.keys.length <= 1) return; // nothing to rotate to
+		pi.on("after_provider_response", async (event, ctx) => {
+			if (ctx.model?.provider !== PROVIDER) return;
+			watchdog?.response(event.status);
+			if (event.status !== 429) return;
+			if (watchdogRequestTimedOut) return;
+			if (fixedWindowQuotaActive) return;
+			config = loadConfig();
+			const decision = captureUsageDecision(config, usageDecisionEpoch);
+			if (!decision) return;
+			const usage = await fetchOpenCodeGoUsage(decision.target, fetchApi, options.timers);
+			config = loadConfig();
+			if (!isCurrentUsageDecision(decision, config, usageDecisionEpoch)) return;
+			if (fixedWindowQuotaActive) return;
+			if (hasRateLimitedUsageWindow(usage)) {
+				pauseAutomaticRotation(ctx);
+				ctx.ui.notify(formatUsageStatus(usage), "warning");
+				return;
+			}
+			if (config.keys.length <= 1) return;
 
-		// Deduplicate with message_end handler. If this returns, leave
-		// watchdogRateLimitRotated false so a later 429-body hang can still rotate.
 		const currentTime = now();
 		if (isRotationDeduplicated(currentTime)) return;
 		recordRotation(currentTime);
@@ -582,7 +818,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
 	});
 
-	pi.registerCommand("opencode", {
+		pi.registerCommand("opencode", {
 		description: "Manage OpenCode API key rotation",
 		handler: async (args, ctx) => {
 			const parts = args.trim().split(/\s+/);
@@ -601,6 +837,14 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				case "events":
 				case "timeouts": {
 					ctx.ui.notify(formatWatchdogEvents(watchdogEvents, now()), "info");
+					break;
+				}
+
+				case "usage":
+				case "quota": {
+					config = loadConfig();
+					const usage = await fetchOpenCodeGoUsage(getActiveUsageTarget(config), fetchApi, options.timers);
+					ctx.ui.notify(formatUsageStatus(usage), usage.ok ? "info" : "warning");
 					break;
 				}
 
@@ -737,24 +981,27 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 				default:
 					ctx.ui.notify(
-						"Usage: /opencode [status|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
+						"Usage: /opencode [status|usage|quota|events|use <n>|next|add <name> <key>|rm <n>|reset|cooldown <min>|watchdog [status|on|off|<seconds>]]",
 						"info",
 					);
 			}
 		},
 	});
 
-	pi.on("agent_end", () => {
-		stopWatchdog();
-		resetWatchdogAbortState();
-		clearWatchdogTimeoutGuard();
-	});
+		function cleanupLifecycleState(): void {
+			invalidateAutomaticDecisions();
+			stopWatchdog();
+			resetWatchdogAbortState();
+			clearWatchdogTimeoutGuard();
+		}
 
-	pi.on("session_shutdown", async () => {
-		stopWatchdog();
-		resetWatchdogAbortState();
-		clearWatchdogTimeoutGuard();
-		saveConfig(config);
+		pi.on("agent_end", () => {
+			cleanupLifecycleState();
+		});
+
+		pi.on("session_shutdown", async () => {
+			cleanupLifecycleState();
+			saveConfig(config);
 	});
 	};
 }

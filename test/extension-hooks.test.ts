@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createOpencodeGoRotationExtension, getOpenCodeGoUsageUrl, parseOpenCodeGoUsage } from "../src/index.ts";
+import { createOpencodeGoRotationExtension, parseOpenCodeGoUsage } from "../src/index.ts";
 
 interface FakeTimerEntry {
 	callback: () => void;
@@ -166,7 +166,6 @@ function createHarness(registryShape: "authStorage" | "runtime" = "authStorage",
 test("usage helpers parse the upstream response shape", () => {
 	const activeStatus: OpenCodeGoUsageWindowStatus = "active";
 	assert.equal(activeStatus, "active");
-	assert.equal(getOpenCodeGoUsageUrl("https://opencode.ai/zen/go/v1/"), "https://opencode.ai/zen/go/v1/usage");
 	assert.deepEqual(parseOpenCodeGoUsage({
 		plan: "lite",
 		useBalance: true,
@@ -343,9 +342,7 @@ test("usage command times out and aborts an unresponsive usage request", async (
 		let usageSignal: AbortSignal | undefined;
 		const fetch: FetchApi = async (_url, init) => {
 			usageSignal = init.signal;
-			return await new Promise((_resolve, reject) => {
-				init.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-			});
+			return await new Promise(() => {});
 		};
 		const { pi, ctx, state, timers } = createHarness("authStorage", fetch);
 
@@ -359,6 +356,74 @@ test("usage command times out and aborts an unresponsive usage request", async (
 		assert.equal(completed, true);
 		assert.equal(usageSignal?.aborted, true);
 		assert.match(state.notifications.at(-1) ?? "", /timed out after 10s/);
+	});
+});
+
+test("usage timeout keeps the timeout result when fetch rejects on abort", async () => {
+	await withTempConfig(async () => {
+		const fetch: FetchApi = async (_url, init) => await new Promise((_resolve, reject) => {
+			init.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+		});
+		const { pi, ctx, state, timers } = createHarness("authStorage", fetch);
+
+		const command = pi.runCommand("opencode", "usage", ctx);
+		timers.fireByDelay(10_000);
+		await command;
+
+		assert.match(state.notifications.at(-1) ?? "", /timed out after 10s/);
+	});
+});
+
+test("removing the fetched key invalidates a late quota result for its replacement index", async () => {
+	await withTempConfig(async () => {
+		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
+		const fetch: FetchApi = async () => await new Promise((resolve) => {
+			resolveUsage = resolve;
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
+		await pi.runCommand("opencode", "rm 1", ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+
+		assert.ok(resolveUsage);
+		resolveUsage({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "5-hour", status: "rate-limited", usagePercent: 100 }] }),
+		});
+		await responseHook;
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.doesNotMatch(state.notifications.join("\n"), /automatic key rotation paused|OpenCode usage/);
+	});
+});
+
+test("a new request invalidates a late quota result for the same key", async () => {
+	await withTempConfig(async () => {
+		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
+		const fetch: FetchApi = async () => await new Promise((resolve) => {
+			resolveUsage = resolve;
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+
+		assert.ok(resolveUsage);
+		resolveUsage({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "5-hour", status: "rate-limited", usagePercent: 100 }] }),
+		});
+		await responseHook;
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		assert.doesNotMatch(state.notifications.join("\n"), /automatic key rotation paused|OpenCode usage/);
 	});
 });
 
