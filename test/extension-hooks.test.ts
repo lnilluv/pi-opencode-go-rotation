@@ -1,10 +1,11 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { FetchApi, OpenCodeGoUsageWindowStatus } from "../src/index.ts";
 import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createOpencodeGoRotationExtension } from "../src/index.ts";
+import { createOpencodeGoRotationExtension, getOpenCodeGoUsageUrl, parseOpenCodeGoUsage } from "../src/index.ts";
 
 interface FakeTimerEntry {
 	callback: () => void;
@@ -28,6 +29,14 @@ class FakeTimers {
 
 	fireAll(): void {
 		const pending = Object.entries(this.timers);
+		for (const [id, entry] of pending) {
+			delete this.timers[Number(id)];
+			entry.callback();
+		}
+	}
+
+	fireByDelay(ms: number): void {
+		const pending = Object.entries(this.timers).filter(([, entry]) => entry.ms === ms);
 		for (const [id, entry] of pending) {
 			delete this.timers[Number(id)];
 			entry.callback();
@@ -94,7 +103,7 @@ function createContext(state: FakeContextState, registryShape: "authStorage" | "
 		},
 	};
 	const context = {
-		model: { provider: "opencode-go" },
+		model: { provider: "opencode-go", baseUrl: "https://example.test/opencode" },
 		modelRegistry: {
 			getApiKeyForProvider: async () => undefined,
 			[registryShape]: keyStore,
@@ -143,16 +152,30 @@ function withTempConfig(run: (configPath: string) => Promise<void>): Promise<voi
 	});
 }
 
-function createHarness(registryShape: "authStorage" | "runtime" = "authStorage"): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
+function createHarness(registryShape: "authStorage" | "runtime" = "authStorage", fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) })): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
 	const timers = new FakeTimers();
 	const clock = new FakeClock();
 	const pi = new FakePi();
 	const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0 };
 	const ctx = createContext(state, registryShape);
-	const extension = createOpencodeGoRotationExtension({ timers, clock });
+	const extension = createOpencodeGoRotationExtension({ timers, clock, fetch });
 	extension(pi as unknown as ExtensionAPI);
 	return { pi, ctx, state, timers, clock };
 }
+
+test("usage helpers parse the upstream response shape", () => {
+	const activeStatus: OpenCodeGoUsageWindowStatus = "active";
+	assert.equal(activeStatus, "active");
+	assert.equal(getOpenCodeGoUsageUrl("https://opencode.ai/zen/go/v1/"), "https://opencode.ai/zen/go/v1/usage");
+	assert.deepEqual(parseOpenCodeGoUsage({
+		plan: "lite",
+		useBalance: true,
+		windows: [{ name: "5-hour", status: "ok", usagePercent: 70, resetInSec: 8_100, used: 8.4, limit: 12 }],
+	}), {
+		windows: [{ name: "5-hour", status: "active", usagePercent: 70, resetInSec: 8_100, used: 8.4, limit: 12 }],
+	});
+	assert.deepEqual(parseOpenCodeGoUsage({ windows: [{ name: "5-hour", status: "bad" }] }), { windows: [{ name: "5-hour", status: "unknown" }] });
+});
 
 test("session start supports the current model registry runtime store", async () => {
 	await withTempConfig(async () => {
@@ -283,6 +306,131 @@ test("fixed-window quota errors pause automatic rotation until manual selection"
 		assert.equal(state.runtimeKeys.at(-1), "sk-one");
 
 		await pi.runCommand("opencode", "next", ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("usage command fetches active key usage without exposing key material", async () => {
+	await withTempConfig(async () => {
+		const calls: Array<{ url: string; authorization?: string }> = [];
+		const fetch: FetchApi = async (url, init) => {
+			calls.push({ url, authorization: init.headers.Authorization });
+			return {
+				ok: true,
+				status: 200,
+				json: async () => ({
+					plan: "lite",
+					useBalance: false,
+					windows: [{ name: "5-hour", status: "active", usagePercent: 70, resetInSec: 8_100, used: 8.4, limit: 12, remaining: 3.6 }],
+				}),
+			};
+		};
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+		Object.assign(ctx, { model: { provider: "deepseek", baseUrl: "https://api.deepseek.com" } });
+
+		await pi.runCommand("opencode", "usage", ctx);
+
+		assert.deepEqual(calls, [{ url: "https://opencode.ai/zen/go/v1/usage", authorization: "Bearer sk-one" }]);
+		const notification = state.notifications.at(-1) ?? "";
+		assert.match(notification, /OpenCode usage for one/);
+		assert.match(notification, /5-hour: active; 70% used; 8\.4\/12 used; 3\.6 remaining; resets in 2h 15m/);
+		assert.doesNotMatch(notification, /sk-one/);
+	});
+});
+
+test("usage command times out and aborts an unresponsive usage request", async () => {
+	await withTempConfig(async () => {
+		let usageSignal: AbortSignal | undefined;
+		const fetch: FetchApi = async (_url, init) => {
+			usageSignal = init.signal;
+			return await new Promise((_resolve, reject) => {
+				init.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+			});
+		};
+		const { pi, ctx, state, timers } = createHarness("authStorage", fetch);
+
+		const command = pi.runCommand("opencode", "usage", ctx);
+		timers.fireByDelay(10_000);
+		const completed = await Promise.race([
+			command.then(() => true),
+			new Promise<false>((resolve) => globalThis.setTimeout(() => resolve(false), 25)),
+		]);
+
+		assert.equal(completed, true);
+		assert.equal(usageSignal?.aborted, true);
+		assert.match(state.notifications.at(-1) ?? "", /timed out after 10s/);
+	});
+});
+
+test("late quota usage after watchdog rotation cannot pause the new key", async () => {
+	await withTempConfig(async () => {
+		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
+		const fetch: FetchApi = async () => await new Promise((resolve) => {
+			resolveUsage = resolve;
+		});
+		const { pi, ctx, state, timers, clock } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
+		clock.advance(90_000);
+		timers.fireByDelay(90_000);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+
+		assert.ok(resolveUsage);
+		resolveUsage({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "5-hour", status: "rate-limited", usagePercent: 100 }] }),
+		});
+		await responseHook;
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.doesNotMatch(state.notifications.join("\n"), /automatic key rotation paused/);
+	});
+});
+
+test("unknown command help lists the quota alias", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "unknown", ctx);
+
+		assert.match(state.notifications.at(-1) ?? "", /usage\|quota/);
+	});
+});
+
+test("http 429 pauses rotation when usage endpoint reports a rate-limited window", async () => {
+	await withTempConfig(async () => {
+		const fetch: FetchApi = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({
+				plan: "lite",
+				useBalance: false,
+				windows: [{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 86_400, used: 30, limit: 30 }],
+			}),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		assert.match(state.notifications.join("\n"), /automatic key rotation paused/);
+		assert.match(state.notifications.join("\n"), /weekly: rate-limited; 100% used/);
+	});
+});
+
+test("http 429 preserves transient rotation when usage endpoint is unavailable", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state, clock } = createHarness("authStorage", async () => ({ ok: false, status: 404, json: async () => ({}) }));
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		clock.advance(6_000);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
 	});
 });
