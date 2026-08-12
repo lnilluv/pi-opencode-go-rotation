@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import type { FetchApi, OpenCodeGoUsageWindowStatus } from "../src/index.ts";
-import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -136,20 +136,41 @@ function writeConfig(path: string): void {
 	}), { mode: 0o600 });
 }
 
-function withTempConfig(run: (configPath: string) => Promise<void>): Promise<void> {
+function readConfig(path: string): {
+	activeKeyIndex: number;
+	cooldowns: Record<string, number>;
+	quotaBlockedUntil?: Record<string, number>;
+} {
+	return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+
+let tempConfigQueue = Promise.resolve();
+
+async function withTempConfig(run: (configPath: string) => Promise<void>): Promise<void> {
+	const previous = tempConfigQueue;
+	let release: () => void = () => {};
+	tempConfigQueue = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	await previous;
+
 	const dir = mkdtempSync(join(tmpdir(), "opencode-rotation-test-"));
 	const configPath = join(dir, "opencode-keys.json");
-	const previous = process.env.PI_OPENCODE_ROTATION_CONFIG;
+	const previousConfigPath = process.env.PI_OPENCODE_ROTATION_CONFIG;
 	process.env.PI_OPENCODE_ROTATION_CONFIG = configPath;
 	writeConfig(configPath);
-	return run(configPath).finally(() => {
-		if (previous === undefined) {
+	try {
+		await run(configPath);
+	} finally {
+		if (previousConfigPath === undefined) {
 			delete process.env.PI_OPENCODE_ROTATION_CONFIG;
 		} else {
-			process.env.PI_OPENCODE_ROTATION_CONFIG = previous;
+			process.env.PI_OPENCODE_ROTATION_CONFIG = previousConfigPath;
 		}
 		rmSync(dir, { recursive: true, force: true });
-	});
+		release();
+	}
 }
 
 function createHarness(registryShape: "authStorage" | "runtime" = "authStorage", fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) })): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
@@ -274,7 +295,7 @@ test("hook replay reuses the 429-rotated key when the 429 body hangs", async () 
 	});
 });
 
-test("hook replay rotates on a dedup-suppressed second 429 hang", async () => {
+test("hook replay keeps the rapid-retry rotation when the second 429 hangs", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state, timers, clock } = createHarness();
 
@@ -295,12 +316,28 @@ test("hook replay rotates on a dedup-suppressed second 429 hang", async () => {
 		assert.equal(state.aborts, 1);
 		assert.deepEqual(state.runtimeKeys.at(-1), "sk-three");
 		assert.match(JSON.stringify(result), /last HTTP 429/);
-		assert.match(JSON.stringify(result), /rotated to three/);
+		assert.match(JSON.stringify(result), /using three/);
 	});
 });
 
-test("fixed-window quota errors pause automatic rotation until manual selection", async () => {
+test("a rapid retry can rotate again in a new request", async () => {
 	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+	});
+});
+
+test("fixed-window quota errors block the failed key and rotate automatically", async () => {
+	await withTempConfig(async (configPath) => {
 		const { pi, ctx, state } = createHarness();
 		const quotaError = "You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z";
 
@@ -308,15 +345,131 @@ test("fixed-window quota errors pause automatic rotation until manual selection"
 		await pi.emit("message_end", {
 			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: quotaError },
 		}, ctx);
-		assert.equal(state.runtimeKeys.at(-1), "sk-one");
-		assert.match(state.notifications.join("\n"), /automatic key rotation paused/);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], Date.parse("2026-08-01T12:00:00Z"));
+	});
+});
 
+test("fixed-window quota errors fall back to the cooldown when no reset is parseable", async () => {
+	await withTempConfig(async (configPath) => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("message_end", {
+			message: {
+				role: "assistant",
+				provider: "opencode-go",
+				stopReason: "error",
+				errorMessage: "You have exceeded the 5-hour usage quota.",
+			},
+		}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 3_600_000);
+	});
+});
+
+test("response quota rotation and message_end cannot rotate twice", async () => {
+	await withTempConfig(async (configPath) => {
+		const fetch: FetchApi = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
-		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		await pi.emit("message_end", {
+			message: {
+				role: "assistant",
+				provider: "opencode-go",
+				stopReason: "error",
+				errorMessage: "You have exceeded the weekly usage quota. It will reset at 2026-08-01T12:00:00Z",
+			},
+		}, ctx);
 
-		await pi.runCommand("opencode", "next", ctx);
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000 });
+	});
+});
+
+test("sequential quota failures try each key once and then stop", async () => {
+	await withTempConfig(async (configPath) => {
+		const fetch: FetchApi = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		for (const expectedKey of ["sk-two", "sk-three", "sk-three"]) {
+			await pi.emit("before_provider_request", {}, ctx);
+			await pi.emit("after_provider_response", { status: 429 }, ctx);
+			assert.equal(state.runtimeKeys.at(-1), expectedKey);
+		}
+		await pi.emit("message_end", {
+			message: {
+				role: "assistant",
+				provider: "opencode-go",
+				stopReason: "error",
+				errorMessage: "You have exceeded the weekly usage quota. It will reset at 2026-08-01T12:00:00Z",
+			},
+		}, ctx);
+
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {
+			"0": 3_600_000,
+			"1": 3_600_000,
+			"2": 3_600_000,
+		});
+		assert.match(state.notifications.join("\n"), /all configured keys.*quota-blocked/i);
+		assert.equal(state.notifications.filter((message) => /all configured keys.*quota-blocked/i.test(message)).length, 1);
+	});
+});
+
+test("transient all-cooldown fallback skips active quota blocks", async () => {
+	await withTempConfig(async (configPath) => {
+		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+		writeFileSync(configPath, JSON.stringify({
+			...persisted,
+			cooldowns: { 1: 0, 2: 0 },
+			quotaBlockedUntil: { 1: 3_600_000 },
+		}), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness();
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "429 rate limit" },
+		}, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "1": 3_600_000 });
+	});
+});
+
+test("quota exhaustion falls back to a cooling key instead of keeping the blocked key active", async () => {
+	await withTempConfig(async (configPath) => {
+		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+		writeFileSync(configPath, JSON.stringify({
+			...persisted,
+			cooldowns: { 1: 0, 2: 0 },
+		}), { mode: 0o600 });
+		const fetch: FetchApi = async () => ({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 429 }, ctx);
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000 });
+		assert.deepEqual(readConfig(configPath).cooldowns, { "2": 0 });
 	});
 });
 
@@ -386,7 +539,7 @@ test("usage timeout keeps the timeout result when fetch rejects on abort", async
 });
 
 test("removing the fetched key invalidates a late quota result for its replacement index", async () => {
-	await withTempConfig(async () => {
+	await withTempConfig(async (configPath) => {
 		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
 		const fetch: FetchApi = async () => await new Promise((resolve) => {
 			resolveUsage = resolve;
@@ -408,12 +561,13 @@ test("removing the fetched key invalidates a late quota result for its replaceme
 		await responseHook;
 
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
 		assert.doesNotMatch(state.notifications.join("\n"), /automatic key rotation paused|OpenCode usage/);
 	});
 });
 
 test("a new request invalidates a late quota result for the same key", async () => {
-	await withTempConfig(async () => {
+	await withTempConfig(async (configPath) => {
 		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
 		const fetch: FetchApi = async () => await new Promise((resolve) => {
 			resolveUsage = resolve;
@@ -434,12 +588,39 @@ test("a new request invalidates a late quota result for the same key", async () 
 		await responseHook;
 
 		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil ?? {}, {});
 		assert.doesNotMatch(state.notifications.join("\n"), /automatic key rotation paused|OpenCode usage/);
 	});
 });
 
+test("session reload invalidates a pending quota decision", async () => {
+	await withTempConfig(async (configPath) => {
+		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
+		const fetch: FetchApi = async () => await new Promise((resolve) => {
+			resolveUsage = resolve;
+		});
+		const { pi, ctx, state } = createHarness("authStorage", fetch);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		const responseHook = pi.emit("after_provider_response", { status: 429 }, ctx);
+		await pi.emit("session_start", { reason: "reload" }, ctx);
+
+		assert.ok(resolveUsage);
+		resolveUsage({
+			ok: true,
+			status: 200,
+			json: async () => ({ windows: [{ name: "weekly", status: "rate-limited", resetInSec: 3_600 }] }),
+		});
+		await responseHook;
+
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil ?? {}, {});
+	});
+});
+
 test("late quota usage after watchdog rotation cannot pause the new key", async () => {
-	await withTempConfig(async () => {
+	await withTempConfig(async (configPath) => {
 		let resolveUsage: ((response: Awaited<ReturnType<FetchApi>>) => void) | undefined;
 		const fetch: FetchApi = async () => await new Promise((resolve) => {
 			resolveUsage = resolve;
@@ -462,6 +643,7 @@ test("late quota usage after watchdog rotation cannot pause the new key", async 
 		await responseHook;
 
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil ?? {}, {});
 		assert.doesNotMatch(state.notifications.join("\n"), /automatic key rotation paused/);
 	});
 });
@@ -476,15 +658,18 @@ test("unknown command help lists the quota alias", async () => {
 	});
 });
 
-test("http 429 pauses rotation when usage endpoint reports a rate-limited window", async () => {
-	await withTempConfig(async () => {
+test("http 429 rotates and persists the latest authoritative usage reset", async () => {
+	await withTempConfig(async (configPath) => {
 		const fetch: FetchApi = async () => ({
 			ok: true,
 			status: 200,
 			json: async () => ({
 				plan: "lite",
 				useBalance: false,
-				windows: [{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 86_400, used: 30, limit: 30 }],
+				windows: [
+					{ name: "5-hour", status: "rate-limited", usagePercent: 100, resetInSec: 3_600 },
+					{ name: "weekly", status: "rate-limited", usagePercent: 100, resetInSec: 86_400, used: 30, limit: 30 },
+				],
 			}),
 		});
 		const { pi, ctx, state } = createHarness("authStorage", fetch);
@@ -493,8 +678,8 @@ test("http 429 pauses rotation when usage endpoint reports a rate-limited window
 		await pi.emit("before_provider_request", {}, ctx);
 		await pi.emit("after_provider_response", { status: 429 }, ctx);
 
-		assert.equal(state.runtimeKeys.at(-1), "sk-one");
-		assert.match(state.notifications.join("\n"), /automatic key rotation paused/);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], 86_400_000);
 		assert.match(state.notifications.join("\n"), /weekly: rate-limited; 100% used/);
 	});
 });
@@ -511,32 +696,75 @@ test("http 429 preserves transient rotation when usage endpoint is unavailable",
 	});
 });
 
-test("a successful provider message resumes automatic rotation after a quota hold", async () => {
-	await withTempConfig(async () => {
-		const { pi, ctx, state } = createHarness();
+test("expired quota blocks become eligible again", async () => {
+	await withTempConfig(async (configPath) => {
+		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+		writeFileSync(configPath, JSON.stringify({
+			...persisted,
+			quotaBlockedUntil: { 0: 1_000, 1: 5_000, 2: 5_000 },
+		}), { mode: 0o600 });
+		const { pi, ctx, state, clock } = createHarness();
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
-		await pi.emit("message_end", {
-			message: {
-				role: "assistant",
-				provider: "opencode-go",
-				stopReason: "error",
-				errorMessage: "You have exceeded the 5-hour usage quota. It will reset at 2026-08-01T12:00:00Z",
-			},
-		}, ctx);
-		await pi.emit("message_end", {
-			message: { role: "assistant", provider: "opencode-go", stopReason: "stop", errorMessage: "" },
-		}, ctx);
+		assert.equal(state.runtimeKeys.length, 0);
 
-		await pi.emit("before_provider_request", {}, ctx);
-		await pi.emit("after_provider_response", { status: 429 }, ctx);
+		clock.advance(1_001);
+		await pi.emit("session_start", { reason: "reload" }, ctx);
 
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+	});
+});
+
+test("manual use, next, and reset clear their intended quota blocks", async () => {
+	await withTempConfig(async (configPath) => {
+		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+		writeFileSync(configPath, JSON.stringify({
+			...persisted,
+			cooldowns: { 0: 10, 1: 20, 2: 30 },
+			quotaBlockedUntil: { 0: 3_600_000, 1: 3_600_000, 2: 3_600_000 },
+		}), { mode: 0o600 });
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "use 2", ctx);
 		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 10, "2": 30 });
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000, "2": 3_600_000 });
+
+		await pi.runCommand("opencode", "next", ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-three");
+		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 10 });
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 3_600_000 });
+
+		await pi.runCommand("opencode", "reset", ctx);
+		assert.deepEqual(readConfig(configPath).cooldowns, {});
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
+	});
+});
+
+test("removing a key reindexes cooldown and quota maps", async () => {
+	await withTempConfig(async (configPath) => {
+		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+		writeFileSync(configPath, JSON.stringify({
+			...persisted,
+			cooldowns: { 0: 10, 1: 20, 2: 30 },
+			quotaBlockedUntil: { 0: 100, 1: 200, 2: 300 },
+		}), { mode: 0o600 });
+		const { pi, ctx } = createHarness();
+
+		await pi.runCommand("opencode", "rm 2", ctx);
+
+		assert.deepEqual(readConfig(configPath).cooldowns, { "0": 10, "1": 30 });
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, { "0": 100, "1": 300 });
 	});
 });
 
 test("status shows key names without exposing key material", async () => {
-	await withTempConfig(async () => {
+	await withTempConfig(async (configPath) => {
+		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+		writeFileSync(configPath, JSON.stringify({
+			...persisted,
+			quotaBlockedUntil: { 1: 120_000 },
+		}), { mode: 0o600 });
 		const { pi, ctx, state } = createHarness();
 
 		await pi.runCommand("opencode", "status", ctx);
@@ -544,7 +772,18 @@ test("status shows key names without exposing key material", async () => {
 		const status = state.notifications.at(-1) ?? "";
 		assert.match(status, /one/);
 		assert.match(status, /two/);
+		assert.match(status, /two \[quota-blocked 2m\]/);
 		assert.doesNotMatch(status, /sk-one|sk-two|sk-three/);
+	});
+});
+
+test("missing quota block config loads as empty", async () => {
+	await withTempConfig(async (configPath) => {
+		const { pi, ctx } = createHarness();
+
+		await pi.runCommand("opencode", "use 2", ctx);
+
+		assert.deepEqual(readConfig(configPath).quotaBlockedUntil, {});
 	});
 });
 

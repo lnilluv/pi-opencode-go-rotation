@@ -27,6 +27,7 @@ interface Config {
 	watchdogIdleMs: number;
 	/** Key index → epoch ms when cooldown started */
 	cooldowns: Record<number, number>;
+	quotaBlockedUntil: Record<number, number>;
 }
 
 const EMPTY_CONFIG: Config = {
@@ -36,6 +37,7 @@ const EMPTY_CONFIG: Config = {
 	watchdogEnabled: true,
 	watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
 	cooldowns: {},
+	quotaBlockedUntil: {},
 };
 
 function getConfigPath(): string {
@@ -45,12 +47,17 @@ function getConfigPath(): string {
 
 function loadConfig(): Config {
 	const path = getConfigPath();
-	if (!existsSync(path)) return { ...EMPTY_CONFIG };
+	if (!existsSync(path)) return { ...EMPTY_CONFIG, cooldowns: {}, quotaBlockedUntil: {} };
 	try {
 		const parsed = JSON.parse(readFileSync(path, "utf-8"));
-		return { ...EMPTY_CONFIG, ...parsed, cooldowns: parsed.cooldowns ?? {} };
+		return {
+			...EMPTY_CONFIG,
+			...parsed,
+			cooldowns: parsed.cooldowns ?? {},
+			quotaBlockedUntil: parsed.quotaBlockedUntil ?? {},
+		};
 	} catch {
-		return { ...EMPTY_CONFIG };
+		return { ...EMPTY_CONFIG, cooldowns: {}, quotaBlockedUntil: {} };
 	}
 }
 
@@ -282,19 +289,26 @@ export class ProviderIdleWatchdog {
 	}
 }
 
-/** Return index of first key not on cooldown, starting from `config.activeKeyIndex`. */
+function getQuotaBlockedUntil(config: Config, keyIndex: number, now: number): number | undefined {
+	const blockedUntil = config.quotaBlockedUntil[keyIndex];
+	return typeof blockedUntil === "number" && Number.isFinite(blockedUntil) && blockedUntil > now
+		? blockedUntil
+		: undefined;
+}
+
 function pickAvailableKeyIndex(config: Config, now = Date.now()): number | undefined {
 	const cdMs = getCooldownMs(config);
 	for (let i = 0; i < config.keys.length; i++) {
 		const idx = (config.activeKeyIndex + i) % config.keys.length;
+		if (getQuotaBlockedUntil(config, idx, now) !== undefined) continue;
 		const cooldownStart = config.cooldowns[idx];
 		if (cooldownStart === undefined || now - cooldownStart >= cdMs) return idx;
 	}
 	return undefined;
 }
 
-/** Mark current key on cooldown, advance to next available. Returns new index. */
-function rotateToNextKey(config: Config, options: RotateOptions = {}): number {
+function rotateToNextKey(config: Config, options: RotateOptions = {}): number | undefined {
+	if (config.keys.length === 0) return undefined;
 	const now = options.now ?? Date.now();
 	config.cooldowns[config.activeKeyIndex] = now;
 	const next = pickAvailableKeyIndex(config, now);
@@ -303,11 +317,16 @@ function rotateToNextKey(config: Config, options: RotateOptions = {}): number {
 		saveConfig(config);
 		return next;
 	}
-	// All keys on cooldown — force-advance and clear next key's cooldown
-	config.activeKeyIndex = (config.activeKeyIndex + 1) % config.keys.length;
-	delete config.cooldowns[config.activeKeyIndex];
+	for (let offset = 1; offset <= config.keys.length; offset++) {
+		const candidate = (config.activeKeyIndex + offset) % config.keys.length;
+		if (getQuotaBlockedUntil(config, candidate, now) !== undefined) continue;
+		config.activeKeyIndex = candidate;
+		delete config.cooldowns[candidate];
+		saveConfig(config);
+		return candidate;
+	}
 	saveConfig(config);
-	return config.activeKeyIndex;
+	return undefined;
 }
 
 
@@ -478,6 +497,74 @@ function hasRateLimitedUsageWindow(result: UsageFetchResult): boolean {
 	return result.ok && result.usage.windows.some((window) => window.status === "rate-limited");
 }
 
+function getRateLimitedUntil(usage: OpenCodeGoUsageResponse, now: number, fallbackMs: number): number {
+	let blockedUntil = now;
+	for (const window of usage.windows) {
+		if (window.status !== "rate-limited") continue;
+		const resetTimes: number[] = [];
+		if (window.resetInSec !== undefined) {
+			const reset = now + window.resetInSec * 1000;
+			if (Number.isFinite(reset) && reset > now) resetTimes.push(reset);
+		}
+		for (const timestamp of [window.resetAt, window.endAt]) {
+			if (!timestamp) continue;
+			const parsed = Date.parse(timestamp);
+			if (Number.isFinite(parsed) && parsed > now) resetTimes.push(parsed);
+		}
+		blockedUntil = Math.max(
+			blockedUntil,
+			resetTimes.length > 0 ? Math.max(...resetTimes) : now + fallbackMs,
+		);
+	}
+	return blockedUntil > now ? blockedUntil : now + fallbackMs;
+}
+
+function getFixedWindowQuotaUntil(message: string, now: number, fallbackMs: number): number {
+	const resetText = message.match(/\b(?:will\s+)?resets?(?:\s+at|\s+on)?\s+([^.;\n]+)/i)?.[1];
+	if (resetText) {
+		const parsed = Date.parse(resetText.trim());
+		if (Number.isFinite(parsed) && parsed > now) return parsed;
+	}
+	return now + fallbackMs;
+}
+
+function getEarliestQuotaReset(config: Config, now: number): number | undefined {
+	const resets = Object.values(config.quotaBlockedUntil).filter(
+		(reset) => typeof reset === "number" && Number.isFinite(reset) && reset > now,
+	);
+	return resets.length > 0 ? Math.min(...resets) : undefined;
+}
+
+function blockQuotaAndSelectNext(config: Config, keyIndex: number, blockedUntil: number, now: number): number | undefined {
+	config.quotaBlockedUntil[keyIndex] = Math.max(
+		getQuotaBlockedUntil(config, keyIndex, now) ?? 0,
+		blockedUntil,
+	);
+	let next = pickAvailableKeyIndex(config, now);
+	if (next === undefined) {
+		for (let offset = 1; offset <= config.keys.length; offset++) {
+			const candidate = (keyIndex + offset) % config.keys.length;
+			if (getQuotaBlockedUntil(config, candidate, now) !== undefined) continue;
+			next = candidate;
+			delete config.cooldowns[candidate];
+			break;
+		}
+	}
+	if (next !== undefined) config.activeKeyIndex = next;
+	saveConfig(config);
+	return next;
+}
+
+function reindexAfterRemoval(record: Record<number, number>, removedIndex: number): Record<number, number> {
+	const shifted: Record<number, number> = {};
+	for (const [key, value] of Object.entries(record)) {
+		const index = Number(key);
+		if (index === removedIndex) continue;
+		shifted[index > removedIndex ? index - 1 : index] = value;
+	}
+	return shifted;
+}
+
 function formatUsageAmount(value: number | undefined): string | undefined {
 	return value === undefined ? undefined : value.toLocaleString("en-US");
 }
@@ -526,7 +613,10 @@ function formatStatus(config: Config, now = Date.now()): string {
 		const marker = i === config.activeKeyIndex ? "→" : " ";
 		const cooldownStart = config.cooldowns[i];
 		let tag = "";
-		if (cooldownStart !== undefined) {
+		const quotaReset = getQuotaBlockedUntil(config, i, now);
+		if (quotaReset !== undefined) {
+			tag = ` [quota-blocked ${formatResetIn(Math.ceil((quotaReset - now) / 1000))}]`;
+		} else if (cooldownStart !== undefined) {
 			const remaining = cdMs - (now - cooldownStart);
 			if (remaining > 0) tag = ` [cooldown ${Math.ceil(remaining / 60_000)}m]`;
 		}
@@ -586,11 +676,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		let watchdogAbortPending = false;
 		let watchdogAbortMessage: string | undefined;
 		let watchdogTimeoutInfo: ProviderTimeoutInfo | undefined;
-		let watchdogRateLimitRotated = false;
+		let watchdogRateLimitHandled = false;
 		let watchdogRequestTimedOut = false;
-		/** Timestamp of the last key rotation for this extension instance. */
 		let lastRotationTime = Number.NEGATIVE_INFINITY;
-		let fixedWindowQuotaActive = false;
+		let lastRotationEpoch = -1;
 		let usageDecisionEpoch = 0;
 		const watchdogEvents: WatchdogEvent[] = [];
 
@@ -604,27 +693,40 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		function recordRotation(rotationTime: number): void {
 			invalidateAutomaticDecisions();
 			lastRotationTime = rotationTime;
+			lastRotationEpoch = usageDecisionEpoch;
 		}
 
 	function isRotationDeduplicated(rotationTime: number): boolean {
 		return rotationTime - lastRotationTime < ROTATION_DEDUP_MS;
 	}
 
-	function pauseAutomaticRotation(ctx: Pick<ExtensionContext, "ui">): void {
-		if (fixedWindowQuotaActive) return;
-		fixedWindowQuotaActive = true;
-		ctx.ui.notify(
-			"OpenCode: Go plan quota window exhausted; automatic key rotation paused to avoid cycling keys on the same workspace. Use /opencode next or /opencode use <n> to try an independent key manually.",
-			"warning",
-		);
-	}
-
-		function resumeAutomaticRotation(): void {
-			invalidateAutomaticDecisions();
-			fixedWindowQuotaActive = false;
+		function isCurrentRequestRotationDeduplicated(rotationTime: number): boolean {
+			return usageDecisionEpoch === lastRotationEpoch
+				&& isRotationDeduplicated(rotationTime);
 		}
 
-
+		function rotateForQuotaExhaustion(
+			ctx: Pick<ExtensionContext, "modelRegistry" | "ui">,
+			keyIndex: number,
+			blockedUntil: number,
+			currentTime: number,
+		): string | undefined {
+			const exhaustedName = config.keys[keyIndex]?.name || `key-${keyIndex + 1}`;
+			const nextIndex = blockQuotaAndSelectNext(config, keyIndex, blockedUntil, currentTime);
+			if (nextIndex === undefined) {
+				invalidateAutomaticDecisions();
+				const earliestReset = getEarliestQuotaReset(config, currentTime);
+				const reset = earliestReset === undefined
+					? "an unknown reset time"
+					: formatResetIn(Math.ceil((earliestReset - currentTime) / 1000));
+				ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota; all configured keys are quota-blocked. Earliest reset in ${reset}.`, "warning");
+				return undefined;
+			}
+			recordRotation(currentTime);
+			const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime) ?? `key-${nextIndex + 1}`;
+			ctx.ui.notify(`OpenCode: ${exhaustedName} reached its plan quota → rotated to ${keyName}`, "info");
+			return keyName;
+		}
 
 	function stopWatchdog(): ProviderTimeoutInfo | undefined {
 		const timeoutInfo = watchdog?.consumeTimeoutInfo();
@@ -637,7 +739,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		watchdogAbortPending = false;
 		watchdogAbortMessage = undefined;
 		watchdogTimeoutInfo = undefined;
-		watchdogRateLimitRotated = false;
+			watchdogRateLimitHandled = false;
 	}
 
 	function clearWatchdogTimeoutGuard(): void {
@@ -653,13 +755,13 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			config = loadConfig();
 			const currentTime = now();
 			if (config.keys.length <= 1) return { rotated: false };
-			if (fixedWindowQuotaActive) {
-				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
-			}
 			if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
-				rotateToNextKey(config, { now: currentTime });
-				recordRotation(currentTime);
-				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: true };
+				const previousIndex = config.activeKeyIndex;
+				const nextIndex = rotateToNextKey(config, { now: currentTime });
+				if (nextIndex === undefined) return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
+				const rotated = nextIndex !== previousIndex;
+				if (rotated) recordRotation(currentTime);
+				return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated };
 			}
 			return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
 		}
@@ -683,7 +785,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					idleForMs: idleMs,
 				};
 				const previousKey = config.keys[config.activeKeyIndex]?.name;
-				const rotation = rotateForWatchdog(ctx, timeoutInfo, watchdogRateLimitRotated);
+					const rotation = rotateForWatchdog(ctx, timeoutInfo, watchdogRateLimitHandled);
 				watchdogTimeoutInfo = timeoutInfo;
 				recordWatchdogEvent({
 					time: now(),
@@ -716,6 +818,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 	}
 
 	pi.on("session_start", async (event, ctx) => {
+			invalidateAutomaticDecisions();
 		config = loadConfig();
 		clearWatchdogTimeoutGuard();
 		// On reload: re-apply active key, skip auto-import
@@ -771,16 +874,24 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		}
 
 		if (message.stopReason !== "error") {
-			resumeAutomaticRotation();
+				invalidateAutomaticDecisions();
 			return;
 		}
 		const rateLimitKind = classifyRateLimitError(message.errorMessage ?? "");
 		if (!rateLimitKind) return;
 		if (rateLimitKind === "fixed-window-quota") {
-			pauseAutomaticRotation(ctx);
+				const currentTime = now();
+				if (watchdogRateLimitHandled || isCurrentRequestRotationDeduplicated(currentTime)) return;
+				config = loadConfig();
+				if (config.keys.length === 0) return;
+				rotateForQuotaExhaustion(
+					ctx,
+					config.activeKeyIndex,
+					getFixedWindowQuotaUntil(message.errorMessage ?? "", currentTime, getCooldownMs(config)),
+					currentTime,
+				);
 			return;
 		}
-		if (fixedWindowQuotaActive) return;
 
 		config = loadConfig();
 		if (config.keys.length <= 1) {
@@ -789,10 +900,14 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		}
 
 		const currentTime = now();
-		if (isRotationDeduplicated(currentTime)) return;
-		recordRotation(currentTime);
-
+			if (isCurrentRequestRotationDeduplicated(currentTime)) return;
 		const newIndex = rotateToNextKey(config, { now: currentTime });
+			if (newIndex === undefined) {
+				invalidateAutomaticDecisions();
+				ctx.ui.notify("OpenCode: Rate limited; all other keys are quota-blocked.", "warning");
+				return;
+			}
+			recordRotation(currentTime);
 		const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
 		ctx.ui.notify(`OpenCode: Rate-limited → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
 	});
@@ -802,27 +917,40 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			watchdog?.response(event.status);
 			if (event.status !== 429) return;
 			if (watchdogRequestTimedOut) return;
-			if (fixedWindowQuotaActive) return;
 			config = loadConfig();
 			const decision = captureUsageDecision(config, usageDecisionEpoch);
 			if (!decision) return;
 			const usage = await fetchOpenCodeGoUsage(decision.target, fetchApi, options.timers);
 			config = loadConfig();
 			if (!isCurrentUsageDecision(decision, config, usageDecisionEpoch)) return;
-			if (fixedWindowQuotaActive) return;
-			if (hasRateLimitedUsageWindow(usage)) {
-				pauseAutomaticRotation(ctx);
+			if (usage.ok && hasRateLimitedUsageWindow(usage)) {
+				const currentTime = now();
+				rotateForQuotaExhaustion(
+					ctx,
+					decision.target.keyIndex,
+					getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)),
+					currentTime,
+				);
+				watchdogRateLimitHandled = true;
 				ctx.ui.notify(formatUsageStatus(usage), "warning");
 				return;
 			}
-			if (config.keys.length <= 1) return;
+			if (config.keys.length <= 1) {
+				watchdogRateLimitHandled = true;
+				return;
+			}
 
 		const currentTime = now();
-		if (isRotationDeduplicated(currentTime)) return;
-		recordRotation(currentTime);
-
+			if (isCurrentRequestRotationDeduplicated(currentTime)) return;
 		const newIndex = rotateToNextKey(config, { now: currentTime });
-		watchdogRateLimitRotated = true;
+			if (newIndex === undefined) {
+				invalidateAutomaticDecisions();
+				watchdogRateLimitHandled = true;
+				ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
+				return;
+			}
+			recordRotation(currentTime);
+			watchdogRateLimitHandled = true;
 		const keyName = applyActiveKey(config, ctx.modelRegistry, currentTime);
 		ctx.ui.notify(`OpenCode: Proactive rate-limit detection (HTTP 429) → rotated to ${keyName ?? `key-${newIndex + 1}`}`, "info");
 	});
@@ -863,9 +991,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify(`Invalid index. Use 1-${config.keys.length}.`, "warning");
 						return;
 					}
-					resumeAutomaticRotation();
+						invalidateAutomaticDecisions();
 					config.activeKeyIndex = targetIndex;
 					delete config.cooldowns[targetIndex];
+						delete config.quotaBlockedUntil[targetIndex];
 					saveConfig(config);
 					const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 					ctx.ui.notify(`Switched to ${keyName}`, "info");
@@ -877,9 +1006,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify("No keys configured. Use /opencode add <name> <key>.", "warning");
 						return;
 					}
-					resumeAutomaticRotation();
+						invalidateAutomaticDecisions();
 					config.activeKeyIndex = (config.activeKeyIndex + 1) % config.keys.length;
 					delete config.cooldowns[config.activeKeyIndex];
+						delete config.quotaBlockedUntil[config.activeKeyIndex];
 					saveConfig(config);
 					const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 					ctx.ui.notify(`Switched to ${keyName}`, "info");
@@ -893,7 +1023,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify("Usage: /opencode add <name> <key>", "warning");
 						return;
 					}
-					resumeAutomaticRotation();
+						invalidateAutomaticDecisions();
 					config.keys.push({ name, key });
 					saveConfig(config);
 					if (config.keys.length === 1) {
@@ -911,16 +1041,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 						ctx.ui.notify(`Invalid index. Use 1-${config.keys.length}.`, "warning");
 						return;
 					}
-					resumeAutomaticRotation();
+						invalidateAutomaticDecisions();
 					const removed = config.keys.splice(removeIndex, 1)[0];
-					delete config.cooldowns[removeIndex];
-					// Reindex cooldowns after removal
-					const shiftedCooldowns: Record<number, number> = {};
-					for (const [key, value] of Object.entries(config.cooldowns)) {
-						const numericKey = parseInt(key, 10);
-						shiftedCooldowns[numericKey > removeIndex ? numericKey - 1 : numericKey] = value;
-					}
-					config.cooldowns = shiftedCooldowns;
+						config.cooldowns = reindexAfterRemoval(config.cooldowns, removeIndex);
+						config.quotaBlockedUntil = reindexAfterRemoval(config.quotaBlockedUntil, removeIndex);
 					if (config.activeKeyIndex >= config.keys.length) {
 						config.activeKeyIndex = 0;
 					} else if (removeIndex < config.activeKeyIndex) {
@@ -937,10 +1061,11 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				}
 
 				case "reset":
-					resumeAutomaticRotation();
+						invalidateAutomaticDecisions();
 					config.cooldowns = {};
+						config.quotaBlockedUntil = {};
 					saveConfig(config);
-					ctx.ui.notify("All cooldowns cleared", "info");
+						ctx.ui.notify("All cooldowns and quota blocks cleared", "info");
 					break;
 
 				case "cooldown": {
