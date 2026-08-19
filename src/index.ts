@@ -1,72 +1,20 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import {
+	ConfigLoadError,
+	DEFAULT_COOLDOWN_MINUTES,
+	DEFAULT_WATCHDOG_IDLE_MS,
+	createEmptyConfig,
+	loadConfig,
+	updateConfig,
+	type Config,
+} from "./config-store.ts";
 
 const PROVIDER = "opencode-go";
-const CONFIG_PATH_ENV = "PI_OPENCODE_ROTATION_CONFIG";
-const DEFAULT_COOLDOWN_MINUTES = 60;
-const DEFAULT_WATCHDOG_IDLE_MS = 90_000;
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 const OPENCODE_GO_USAGE_TIMEOUT_MS = 10_000;
 const FIXED_WINDOW_QUOTA_RE = /\b(?:5[- ]hour|weekly|monthly)\b[\s\S]*\b(?:usage\s+)?(?:quota|limit)\b|\b(?:usage|plan)\s+allocated\s+quota\s+exceeded\b|\b(?:quota|limit)\b[\s\S]*\b(?:will\s+reset|resets?\s+at|fixed[- ]window)\b/i;
 const TRANSIENT_RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|quota|usage limit|limit reached/i;
 
-
-interface KeyEntry {
-	name: string;
-	key: string;
-}
-
-interface Config {
-	keys: KeyEntry[];
-	activeKeyIndex: number;
-	cooldownMinutes: number;
-	watchdogEnabled: boolean;
-	watchdogIdleMs: number;
-	/** Key index → epoch ms when cooldown started */
-	cooldowns: Record<number, number>;
-	quotaBlockedUntil: Record<number, number>;
-}
-
-const EMPTY_CONFIG: Config = {
-	keys: [],
-	activeKeyIndex: 0,
-	cooldownMinutes: DEFAULT_COOLDOWN_MINUTES,
-	watchdogEnabled: true,
-	watchdogIdleMs: DEFAULT_WATCHDOG_IDLE_MS,
-	cooldowns: {},
-	quotaBlockedUntil: {},
-};
-
-function getConfigPath(): string {
-	return process.env[CONFIG_PATH_ENV] ?? join(homedir(), ".pi", "agent", "opencode-keys.json");
-}
-
-
-function loadConfig(): Config {
-	const path = getConfigPath();
-	if (!existsSync(path)) return { ...EMPTY_CONFIG, cooldowns: {}, quotaBlockedUntil: {} };
-	try {
-		const parsed = JSON.parse(readFileSync(path, "utf-8"));
-		return {
-			...EMPTY_CONFIG,
-			...parsed,
-			cooldowns: parsed.cooldowns ?? {},
-			quotaBlockedUntil: parsed.quotaBlockedUntil ?? {},
-		};
-	} catch {
-		return { ...EMPTY_CONFIG, cooldowns: {}, quotaBlockedUntil: {} };
-	}
-}
-
-function saveConfig(config: Config): void {
-	const path = getConfigPath();
-	const dir = dirname(path);
-	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-	writeFileSync(path, JSON.stringify(config, null, 2), { mode: 0o600 });
-	chmodSync(path, 0o600);
-}
 
 function getCooldownMs(config: Config): number {
 	return (config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES) * 60_000;
@@ -318,7 +266,6 @@ function rotateToNextKey(config: Config, options: RotateOptions = {}): number | 
 	const next = pickAvailableKeyIndex(config, now);
 	if (next !== undefined) {
 		config.activeKeyIndex = next;
-		saveConfig(config);
 		return next;
 	}
 	for (let offset = 1; offset <= config.keys.length; offset++) {
@@ -326,10 +273,8 @@ function rotateToNextKey(config: Config, options: RotateOptions = {}): number | 
 		if (getQuotaBlockedUntil(config, candidate, now) !== undefined) continue;
 		config.activeKeyIndex = candidate;
 		delete config.cooldowns[candidate];
-		saveConfig(config);
 		return candidate;
 	}
-	saveConfig(config);
 	return undefined;
 }
 
@@ -338,6 +283,8 @@ interface RuntimeKeyStore {
 	setRuntimeApiKey(provider: string, key: string): void | Promise<void>;
 	removeRuntimeApiKey(provider: string): void | Promise<void>;
 }
+
+const lastAppliedRuntimeKeys = new WeakMap<object, string>();
 
 function getRuntimeKeyStore(modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }): RuntimeKeyStore {
 	const store = modelRegistry.authStorage ?? modelRegistry.runtime;
@@ -353,11 +300,12 @@ function ignoreAsyncRefresh(result: void | Promise<void>): void {
 function applyActiveKey(config: Config, modelRegistry: { authStorage?: RuntimeKeyStore; runtime?: RuntimeKeyStore }, now = Date.now()): string | undefined {
 	const idx = pickAvailableKeyIndex(config, now);
 	if (idx === undefined) return undefined;
-	if (config.activeKeyIndex !== idx) {
-		config.activeKeyIndex = idx;
-		saveConfig(config);
+	if (config.activeKeyIndex !== idx) config.activeKeyIndex = idx;
+	const key = config.keys[idx].key;
+	if (lastAppliedRuntimeKeys.get(modelRegistry) !== key) {
+		lastAppliedRuntimeKeys.set(modelRegistry, key);
+		ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntimeApiKey(PROVIDER, key));
 	}
-	ignoreAsyncRefresh(getRuntimeKeyStore(modelRegistry).setRuntimeApiKey(PROVIDER, config.keys[idx].key));
 	return config.keys[idx].name || `key-${idx + 1}`;
 }
 
@@ -568,7 +516,6 @@ function blockQuotaAndSelectNext(config: Config, keyIndex: number, blockedUntil:
 		}
 	}
 	if (next !== undefined) config.activeKeyIndex = next;
-	saveConfig(config);
 	return next;
 }
 
@@ -688,7 +635,8 @@ function formatWatchdogEvents(events: WatchdogEvent[], now = Date.now()): string
 
 export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}) {
 	return function opencodeGoRotationExtension(pi: ExtensionAPI) {
-		let config = loadConfig();
+		let config = createEmptyConfig();
+		let configError: string | undefined;
 		let watchdog: ProviderIdleWatchdog | undefined;
 		let watchdogAbortPending = false;
 		let watchdogAbortMessage: string | undefined;
@@ -701,13 +649,65 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		const now = (): number => options.clock?.now() ?? Date.now();
 		const fetchApi: FetchApi = options.fetch ?? globalThis.fetch.bind(globalThis);
 
+		function formatConfigError(error: unknown): string {
+			if (error instanceof ConfigLoadError) return error.message;
+			if (error instanceof Error) return error.message;
+			return "Unknown configuration error";
+		}
+
+		function refreshConfig(): boolean {
+			try {
+				config = loadConfig();
+				configError = undefined;
+				return true;
+			} catch (error) {
+				configError = formatConfigError(error);
+				return false;
+			}
+		}
+
+		function mutateSharedConfig<T>(mutator: (freshConfig: Config) => T): T | undefined {
+			try {
+				const updated = updateConfig(mutator);
+				config = updated.config;
+				configError = undefined;
+				return updated.result;
+			} catch (error) {
+				configError = formatConfigError(error);
+				return undefined;
+			}
+		}
+
+		function ensureConfig(ctx: Pick<ExtensionContext, "ui">): boolean {
+			if (refreshConfig()) return true;
+			ctx.ui.notify(`OpenCode: ${configError}. No configuration was changed.`, "error");
+			return false;
+		}
+
+		function applySynchronizedActiveKey(ctx: Pick<ExtensionContext, "modelRegistry">): string | undefined {
+			if (!refreshConfig()) return undefined;
+			const availableIndex = pickAvailableKeyIndex(config, now());
+			if (availableIndex !== undefined && availableIndex !== config.activeKeyIndex) {
+				const selectedIndex = mutateSharedConfig((freshConfig) => {
+					const freshAvailableIndex = pickAvailableKeyIndex(freshConfig, now());
+					if (freshAvailableIndex !== undefined) freshConfig.activeKeyIndex = freshAvailableIndex;
+					return freshAvailableIndex;
+				});
+				if (selectedIndex === undefined) return undefined;
+			}
+			return applyActiveKey(config, ctx.modelRegistry, now());
+		}
+
 		function invalidateAutomaticDecisions(): void {
 			usageDecisionEpoch++;
 		}
 
-		function beginProviderRequest(): void {
+		function beginProviderRequest(ctx: Pick<ExtensionContext, "modelRegistry">): void {
 			invalidateAutomaticDecisions();
-			config = loadConfig();
+			if (applySynchronizedActiveKey(ctx) === undefined) {
+				requestRateLimitState = undefined;
+				return;
+			}
 			const decision = captureUsageDecision(config, usageDecisionEpoch);
 			requestRateLimitState = decision ? { decision, responseHandled: false } : undefined;
 		}
@@ -734,8 +734,14 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			isAuthoritative = false,
 		): void {
 			const exhaustedName = config.keys[keyIndex]?.name || `key-${keyIndex + 1}`;
-			const nextIndex = blockQuotaAndSelectNext(config, keyIndex, blockedUntil, currentTime, isAuthoritative);
+			const nextIndex = mutateSharedConfig((freshConfig) =>
+				blockQuotaAndSelectNext(freshConfig, keyIndex, blockedUntil, currentTime, isAuthoritative),
+			);
 			if (nextIndex === undefined) {
+				if (configError) {
+					ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+					return;
+				}
 				invalidateAutomaticDecisions();
 				const earliestReset = getEarliestQuotaReset(config, currentTime);
 				const reset = earliestReset === undefined
@@ -772,12 +778,12 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		}
 
 		function rotateForWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">, timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): { keyName?: string; rotated: boolean } {
-			config = loadConfig();
+			if (!refreshConfig()) return { rotated: false };
 			const currentTime = now();
 			if (config.keys.length <= 1) return { rotated: false };
 			if (shouldRotateAfterWatchdogTimeout(timeoutInfo, rateLimitAlreadyRotated)) {
 				const previousIndex = config.activeKeyIndex;
-				const nextIndex = rotateToNextKey(config, { now: currentTime });
+				const nextIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
 				if (nextIndex === undefined) return { keyName: applyActiveKey(config, ctx.modelRegistry, currentTime), rotated: false };
 				const rotated = nextIndex !== previousIndex;
 				if (rotated) invalidateAutomaticDecisions();
@@ -787,7 +793,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		}
 
 		function startWatchdog(ctx: Pick<ExtensionContext, "modelRegistry" | "ui" | "abort">): void {
-			config = loadConfig();
+			if (!refreshConfig()) return;
+			applyActiveKey(config, ctx.modelRegistry, now());
 			stopWatchdog();
 			resetWatchdogAbortState();
 			clearWatchdogTimeoutGuard();
@@ -831,33 +838,39 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		async function autoImportFromAuth(ctx: Pick<ExtensionContext, "modelRegistry" | "ui">): Promise<boolean> {
 			const authKey = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
 			if (!authKey) return false;
-			// Skip if key already exists in rotation list
-			if (config.keys.some((k) => k.key === authKey)) return false;
-			config.keys.push({ name: "auth", key: authKey });
-			saveConfig(config);
-			return true;
+			const imported = mutateSharedConfig((freshConfig) => {
+				if (freshConfig.keys.some((entry) => entry.key === authKey)) return false;
+				freshConfig.keys.push({ name: "auth", key: authKey });
+				return true;
+			});
+			return imported === true;
 		}
 
 		pi.on("session_start", async (event, ctx) => {
+			lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
 			invalidateAutomaticDecisions();
 			requestRateLimitState = undefined;
-			config = loadConfig();
 			clearWatchdogTimeoutGuard();
+			if (!ensureConfig(ctx)) return;
 			// On reload: re-apply active key, skip auto-import
 			if (event.reason === "reload") {
-				const keyName = applyActiveKey(config, ctx.modelRegistry, now());
+				const keyName = applySynchronizedActiveKey(ctx);
 				if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
 				return;
 			}
 			if (config.keys.length === 0) {
 				if (await autoImportFromAuth(ctx)) {
-					ctx.ui.notify(`OpenCode: Imported key from auth.json → ${applyActiveKey(config, ctx.modelRegistry, now())}`, "info");
+					const keyName = applySynchronizedActiveKey(ctx);
+					if (keyName) ctx.ui.notify(`OpenCode: Imported key from auth.json → ${keyName}`, "info");
+				} else if (configError) {
+					ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+					return;
 				} else {
 					ctx.ui.notify("OpenCode: No keys configured. Use /opencode add <name> <key>", "warning");
 					return;
 				}
 			}
-			const keyName = applyActiveKey(config, ctx.modelRegistry, now());
+			const keyName = applySynchronizedActiveKey(ctx);
 			if (keyName) ctx.ui.notify(`OpenCode: Active key → ${keyName}`, "info");
 		});
 
@@ -870,7 +883,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				clearWatchdogTimeoutGuard();
 				return;
 			}
-			beginProviderRequest();
+			beginProviderRequest(ctx);
 			startWatchdog(ctx);
 		});
 
@@ -906,7 +919,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				invalidateAutomaticDecisions();
 				return;
 			}
-			config = loadConfig();
+			if (!refreshConfig()) return;
 			const requestState = getCurrentRequestRateLimitState();
 			if (!requestState) return;
 			if (rateLimitKind === "fixed-window-quota") {
@@ -914,12 +927,15 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 				const authoritativeReset = parseFixedWindowQuotaReset(message.errorMessage ?? "", currentTime);
 				const blockedUntil = authoritativeReset ?? currentTime + getCooldownMs(config);
 				if (requestState.responseHandled) {
-					if (authoritativeReset === undefined) {
-						setQuotaBlock(config, requestState.decision.target.keyIndex, blockedUntil, currentTime);
-					} else {
-						config.quotaBlockedUntil[requestState.decision.target.keyIndex] = authoritativeReset;
-					}
-					saveConfig(config);
+					const persisted = mutateSharedConfig((freshConfig) => {
+						if (authoritativeReset === undefined) {
+							setQuotaBlock(freshConfig, requestState.decision.target.keyIndex, blockedUntil, currentTime);
+						} else {
+							freshConfig.quotaBlockedUntil[requestState.decision.target.keyIndex] = authoritativeReset;
+						}
+						return true;
+					});
+					if (persisted !== true && configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
 					invalidateAutomaticDecisions();
 					return;
 				}
@@ -944,10 +960,13 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			}
 
 			const currentTime = now();
-			const newIndex = rotateToNextKey(config, { now: currentTime });
+			const newIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
 			if (newIndex === undefined) {
-				invalidateAutomaticDecisions();
-				ctx.ui.notify("OpenCode: Rate limited; all other keys are quota-blocked.", "warning");
+				if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+				else {
+					invalidateAutomaticDecisions();
+					ctx.ui.notify("OpenCode: Rate limited; all other keys are quota-blocked.", "warning");
+				}
 				return;
 			}
 			invalidateAutomaticDecisions();
@@ -960,11 +979,11 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			watchdog?.response(event.status);
 			if (event.status !== 429) return;
 			if (watchdogRequestTimedOut) return;
-			config = loadConfig();
+			if (!refreshConfig()) return;
 			const decision = getCurrentRequestRateLimitState()?.decision;
 			if (!decision) return;
 			const usage = await fetchOpenCodeGoUsage(decision.target, fetchApi, options.timers);
-			config = loadConfig();
+			if (!refreshConfig()) return;
 			if (!isCurrentUsageDecision(decision, config, usageDecisionEpoch)) return;
 			if (usage.ok && hasRateLimitedUsageWindow(usage)) {
 				const currentTime = now();
@@ -984,11 +1003,14 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			}
 
 			const currentTime = now();
-			const newIndex = rotateToNextKey(config, { now: currentTime });
+			const newIndex = mutateSharedConfig((freshConfig) => rotateToNextKey(freshConfig, { now: currentTime }));
 			if (newIndex === undefined) {
-				invalidateAutomaticDecisions();
-				markResponseRateLimitHandled(decision);
-				ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
+				if (configError) ctx.ui.notify(`OpenCode: ${configError}. Automatic rotation was skipped.`, "error");
+				else {
+					invalidateAutomaticDecisions();
+					markResponseRateLimitHandled(decision);
+					ctx.ui.notify("OpenCode: HTTP 429; all other keys are quota-blocked.", "warning");
+				}
 				return;
 			}
 			invalidateAutomaticDecisions();
@@ -1000,9 +1022,10 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		pi.registerCommand("opencode", {
 			description: "Manage OpenCode API key rotation",
 			handler: async (args, ctx) => {
+				if (!ensureConfig(ctx)) return;
 				const parts = args.trim().split(/\s+/);
 				const subcommand = parts[0] || "status";
-				const indexArg = parseInt(parts[1], 10);
+				const indexArg = parseInt(parts[1] ?? "", 10);
 
 				switch (subcommand) {
 					case "status":
@@ -1021,7 +1044,7 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 					case "usage":
 					case "quota": {
-						config = loadConfig();
+						applySynchronizedActiveKey(ctx);
 						const usage = await fetchOpenCodeGoUsage(getActiveUsageTarget(config), fetchApi, options.timers);
 						ctx.ui.notify(formatUsageStatus(usage), usage.ok ? "info" : "warning");
 						break;
@@ -1029,30 +1052,46 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 
 					case "use": {
 						const targetIndex = indexArg - 1;
-						if (isNaN(targetIndex) || targetIndex < 0 || targetIndex >= config.keys.length) {
-							ctx.ui.notify(`Invalid index. Use 1-${config.keys.length}.`, "warning");
+						invalidateAutomaticDecisions();
+						const result = mutateSharedConfig((freshConfig) => {
+							if (isNaN(targetIndex) || targetIndex < 0 || targetIndex >= freshConfig.keys.length) {
+								return { error: `Invalid index. Use 1-${freshConfig.keys.length}.` };
+							}
+							freshConfig.activeKeyIndex = targetIndex;
+							delete freshConfig.cooldowns[targetIndex];
+							delete freshConfig.quotaBlockedUntil[targetIndex];
+							return { index: targetIndex };
+						});
+						if (!result) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
 							return;
 						}
-						invalidateAutomaticDecisions();
-						config.activeKeyIndex = targetIndex;
-						delete config.cooldowns[targetIndex];
-						delete config.quotaBlockedUntil[targetIndex];
-						saveConfig(config);
+						if ("error" in result && typeof result.error === "string") {
+							ctx.ui.notify(result.error, "warning");
+							return;
+						}
 						const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 						ctx.ui.notify(`Switched to ${keyName}`, "info");
 						break;
 					}
 
 					case "next": {
-						if (config.keys.length === 0) {
-							ctx.ui.notify("No keys configured. Use /opencode add <name> <key>.", "warning");
+						invalidateAutomaticDecisions();
+						const result = mutateSharedConfig((freshConfig) => {
+							if (freshConfig.keys.length === 0) return { error: "No keys configured. Use /opencode add <name> <key>." };
+							freshConfig.activeKeyIndex = (freshConfig.activeKeyIndex + 1) % freshConfig.keys.length;
+							delete freshConfig.cooldowns[freshConfig.activeKeyIndex];
+							delete freshConfig.quotaBlockedUntil[freshConfig.activeKeyIndex];
+							return { index: freshConfig.activeKeyIndex };
+						});
+						if (!result) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
 							return;
 						}
-						invalidateAutomaticDecisions();
-						config.activeKeyIndex = (config.activeKeyIndex + 1) % config.keys.length;
-						delete config.cooldowns[config.activeKeyIndex];
-						delete config.quotaBlockedUntil[config.activeKeyIndex];
-						saveConfig(config);
+						if ("error" in result && typeof result.error === "string") {
+							ctx.ui.notify(result.error, "warning");
+							return;
+						}
 						const keyName = applyActiveKey(config, ctx.modelRegistry, now());
 						ctx.ui.notify(`Switched to ${keyName}`, "info");
 						break;
@@ -1066,49 +1105,66 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							return;
 						}
 						invalidateAutomaticDecisions();
-						config.keys.push({ name, key });
-						saveConfig(config);
-						if (config.keys.length === 1) {
-							config.activeKeyIndex = 0;
-							applyActiveKey(config, ctx.modelRegistry, now());
+						const count = mutateSharedConfig((freshConfig) => {
+							freshConfig.keys.push({ name, key });
+							if (freshConfig.keys.length === 1) freshConfig.activeKeyIndex = 0;
+							return freshConfig.keys.length;
+						});
+						if (count === undefined) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
 						}
-						ctx.ui.notify(`Added "${name}" (${config.keys.length} keys)`, "info");
+						if (count === 1) applyActiveKey(config, ctx.modelRegistry, now());
+						ctx.ui.notify(`Added "${name}" (${count} keys)`, "info");
 						break;
 					}
 
 					case "remove":
 					case "rm": {
 						const removeIndex = indexArg - 1;
-						if (isNaN(removeIndex) || removeIndex < 0 || removeIndex >= config.keys.length) {
-							ctx.ui.notify(`Invalid index. Use 1-${config.keys.length}.`, "warning");
+						invalidateAutomaticDecisions();
+						const result = mutateSharedConfig((freshConfig) => {
+							if (isNaN(removeIndex) || removeIndex < 0 || removeIndex >= freshConfig.keys.length) {
+								return { error: `Invalid index. Use 1-${freshConfig.keys.length}.` };
+							}
+							const removed = freshConfig.keys.splice(removeIndex, 1)[0];
+							freshConfig.cooldowns = reindexAfterRemoval(freshConfig.cooldowns, removeIndex);
+							freshConfig.quotaBlockedUntil = reindexAfterRemoval(freshConfig.quotaBlockedUntil, removeIndex);
+							if (freshConfig.activeKeyIndex >= freshConfig.keys.length) freshConfig.activeKeyIndex = 0;
+							else if (removeIndex < freshConfig.activeKeyIndex) freshConfig.activeKeyIndex--;
+							return { removedName: removed.name, count: freshConfig.keys.length };
+						});
+						if (!result) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
 							return;
 						}
-						invalidateAutomaticDecisions();
-						const removed = config.keys.splice(removeIndex, 1)[0];
-						config.cooldowns = reindexAfterRemoval(config.cooldowns, removeIndex);
-						config.quotaBlockedUntil = reindexAfterRemoval(config.quotaBlockedUntil, removeIndex);
-						if (config.activeKeyIndex >= config.keys.length) {
-							config.activeKeyIndex = 0;
-						} else if (removeIndex < config.activeKeyIndex) {
-							config.activeKeyIndex--;
+						if ("error" in result && typeof result.error === "string") {
+							ctx.ui.notify(result.error, "warning");
+							return;
 						}
-						saveConfig(config);
-						if (config.keys.length > 0) {
-							applyActiveKey(config, ctx.modelRegistry, now());
-						} else {
+						if (config.keys.length > 0) applyActiveKey(config, ctx.modelRegistry, now());
+						else {
+							lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
 							ignoreAsyncRefresh(getRuntimeKeyStore(ctx.modelRegistry).removeRuntimeApiKey(PROVIDER));
 						}
-						ctx.ui.notify(`Removed "${removed.name}" (${config.keys.length} left)`, "info");
+						ctx.ui.notify(`Removed "${result.removedName}" (${result.count} left)`, "info");
 						break;
 					}
 
-					case "reset":
+					case "reset": {
 						invalidateAutomaticDecisions();
-						config.cooldowns = {};
-						config.quotaBlockedUntil = {};
-						saveConfig(config);
+						const result = mutateSharedConfig((freshConfig) => {
+							freshConfig.cooldowns = {};
+							freshConfig.quotaBlockedUntil = {};
+							return true;
+						});
+						if (result !== true) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
+						}
 						ctx.ui.notify("All cooldowns and quota blocks cleared", "info");
 						break;
+					}
 
 					case "cooldown": {
 						const minutes = parseInt(parts[1], 10);
@@ -1116,8 +1172,14 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							ctx.ui.notify(`Cooldown: ${config.cooldownMinutes || DEFAULT_COOLDOWN_MINUTES} min`, "info");
 							return;
 						}
-						config.cooldownMinutes = minutes;
-						saveConfig(config);
+						const result = mutateSharedConfig((freshConfig) => {
+							freshConfig.cooldownMinutes = minutes;
+							return true;
+						});
+						if (result !== true) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
+						}
 						ctx.ui.notify(`Cooldown set to ${minutes} min`, "info");
 						break;
 					}
@@ -1129,18 +1191,21 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							ctx.ui.notify(`Watchdog: ${config.watchdogEnabled ? "on" : "off"} (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)\n${events}`, "info");
 							return;
 						}
-						if (value === "on") {
-							config.watchdogEnabled = true;
-							saveConfig(config);
-							ctx.ui.notify(`Watchdog enabled (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)`, "info");
-							return;
-						}
-						if (value === "off") {
-							config.watchdogEnabled = false;
-							saveConfig(config);
-							stopWatchdog();
-							resetWatchdogAbortState();
-							ctx.ui.notify("Watchdog disabled", "info");
+						if (value === "on" || value === "off") {
+							const enabled = value === "on";
+							const result = mutateSharedConfig((freshConfig) => {
+								freshConfig.watchdogEnabled = enabled;
+								return true;
+							});
+							if (result !== true) {
+								if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+								return;
+							}
+							if (!enabled) {
+								stopWatchdog();
+								resetWatchdogAbortState();
+							}
+							ctx.ui.notify(enabled ? `Watchdog enabled (${Math.ceil(getWatchdogIdleMs(config) / 1000)}s idle)` : "Watchdog disabled", "info");
 							return;
 						}
 						const seconds = parseInt(value, 10);
@@ -1148,9 +1213,15 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 							ctx.ui.notify("Usage: /opencode watchdog [status|on|off|<seconds>]", "warning");
 							return;
 						}
-						config.watchdogEnabled = true;
-						config.watchdogIdleMs = seconds * 1000;
-						saveConfig(config);
+						const result = mutateSharedConfig((freshConfig) => {
+							freshConfig.watchdogEnabled = true;
+							freshConfig.watchdogIdleMs = seconds * 1000;
+							return true;
+						});
+						if (result !== true) {
+							if (configError) ctx.ui.notify(`OpenCode: ${configError}.`, "error");
+							return;
+						}
 						ctx.ui.notify(`Watchdog enabled (${seconds}s idle)`, "info");
 						break;
 					}
@@ -1176,9 +1247,8 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 			cleanupLifecycleState();
 		});
 
-		pi.on("session_shutdown", async () => {
+		pi.on("session_shutdown", () => {
 			cleanupLifecycleState();
-			saveConfig(config);
 		});
 	};
 }

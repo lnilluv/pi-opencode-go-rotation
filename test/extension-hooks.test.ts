@@ -892,6 +892,35 @@ test("status does not claim an auth key when none is configured", async () => {
 	});
 });
 
+test("a stale session shutdown cannot erase a key added by another session", async () => {
+	await withTempConfig(async (configPath) => {
+		const first = createHarness();
+		const second = createHarness();
+
+		await first.pi.emit("session_start", { reason: "start" }, first.ctx);
+		await second.pi.emit("session_start", { reason: "start" }, second.ctx);
+		await first.pi.runCommand("opencode", "add fresh sk-fresh", first.ctx);
+		await second.pi.emit("session_shutdown", { reason: "quit" }, second.ctx);
+
+		const persisted = JSON.parse(readFileSync(configPath, "utf-8"));
+		assert.deepEqual(persisted.keys.map((entry: { name: string }) => entry.name), ["one", "two", "three", "fresh"]);
+	});
+});
+
+test("status reloads mutations made by another live session", async () => {
+	await withTempConfig(async () => {
+		const first = createHarness();
+		const second = createHarness();
+
+		await first.pi.emit("session_start", { reason: "start" }, first.ctx);
+		await second.pi.emit("session_start", { reason: "start" }, second.ctx);
+		await first.pi.runCommand("opencode", "add fresh sk-fresh", first.ctx);
+		await second.pi.runCommand("opencode", "status", second.ctx);
+
+		assert.match(second.state.notifications.at(-1) ?? "", /fresh/);
+	});
+});
+
 test("config writes restore private file permissions", async () => {
 	await withTempConfig(async (configPath) => {
 		chmodSync(configPath, 0o644);
