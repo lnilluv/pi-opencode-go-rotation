@@ -222,6 +222,19 @@ test("session start supports the current model registry runtime store", async ()
 	});
 });
 
+test("runtime registry supports resume, reload, and final-key removal", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness("runtime");
+		await pi.emit("session_start", { reason: "resume" }, ctx);
+		await pi.emit("session_start", { reason: "reload" }, ctx);
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-one"]);
+		await pi.runCommand("opencode", "remove 3", ctx);
+		await pi.runCommand("opencode", "remove 2", ctx);
+		await pi.runCommand("opencode", "remove 1", ctx);
+		assert.equal(state.runtimeKeys.at(-1), "removed");
+	});
+});
+
 test("hook replay aborts a no-response hang and rotates", async () => {
 	await withTempConfig(async () => {
 		const { pi, ctx, state, timers, clock } = createHarness();
@@ -774,6 +787,66 @@ test("http 429 rotates and persists the latest authoritative usage reset", async
 		assert.match(state.notifications.join("\n"), /weekly: rate-limited; 100% used/);
 	});
 });
+
+test("http 401 verifies monthly quota and rotates once before retry", async () => {
+	await withTempConfig(async (configPath) => {
+		const reset = "2026-09-01T00:00:00Z";
+		const fetch: FetchApi = async () => ({
+			ok: true, status: 200,
+			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: reset } } }),
+		});
+		const { pi, ctx, state } = createHarness("runtime", fetch);
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 401 }, ctx);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
+		assert.equal(readConfig(configPath).quotaBlockedUntil?.["0"], Date.parse(reset));
+		await pi.emit("message_end", {
+			message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "401 Insufficient balance" },
+		}, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+	});
+});
+
+test("http 401 quota rotation survives a stalled response body without rotating again", async () => {
+	await withTempConfig(async (configPath) => {
+		const { pi, ctx, state, clock, timers } = createHarness("runtime", async () => ({
+			ok: true, status: 200,
+			json: async () => ({ usage: { monthly: { status: "rate-limited", percent: 100, resetsAt: "2026-09-01T00:00:00Z" } } }),
+		}));
+		await pi.emit("session_start", { reason: "start" }, ctx);
+		await pi.emit("before_provider_request", {}, ctx);
+		await pi.emit("after_provider_response", { status: 401 }, ctx);
+		clock.advance(90_000);
+		timers.fireAll();
+		assert.equal(state.aborts, 1);
+		assert.deepEqual(state.runtimeKeys, ["sk-one", "sk-two"]);
+		assert.equal(readConfig(configPath).activeKeyIndex, 1);
+	});
+});
+
+for (const usageResponse of [
+	{ ok: false, status: 401, json: async () => ({}) },
+	{ ok: false, status: 503, json: async () => ({}) },
+	{ ok: true, status: 200, json: async () => ({ usage: { monthly: { status: "ok", percent: 10 } } }) },
+]) {
+	test(`http 401 does not rotate without confirmed quota (${usageResponse.status}, ${usageResponse.ok})`, async () => {
+		await withTempConfig(async (configPath) => {
+			const { pi, ctx, state } = createHarness("runtime", async () => usageResponse);
+			await pi.emit("session_start", { reason: "start" }, ctx);
+			await pi.emit("before_provider_request", {}, ctx);
+			await pi.emit("after_provider_response", { status: 401 }, ctx);
+			await pi.emit("message_end", {
+				message: { role: "assistant", provider: "opencode-go", stopReason: "error", errorMessage: "401 Unauthorized: authentication limit reached; monthly quota" },
+			}, ctx);
+			assert.deepEqual(state.runtimeKeys, ["sk-one"]);
+			assert.equal(readConfig(configPath).activeKeyIndex, 0);
+			assert.deepEqual(readConfig(configPath).quotaBlockedUntil ?? {}, {});
+		});
+	});
+}
 
 test("http 429 preserves transient rotation when usage endpoint is unavailable", async () => {
 	await withTempConfig(async () => {
