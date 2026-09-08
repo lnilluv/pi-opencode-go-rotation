@@ -57,7 +57,7 @@ export interface ProviderTimeoutInfo {
 }
 
 export function shouldRotateAfterWatchdogTimeout(timeoutInfo: ProviderTimeoutInfo, rateLimitAlreadyRotated: boolean): boolean {
-	return timeoutInfo.lastStatus !== 429 || !rateLimitAlreadyRotated;
+	return timeoutInfo.lastStatus !== 401 && (timeoutInfo.lastStatus !== 429 || !rateLimitAlreadyRotated);
 }
 
 
@@ -977,11 +977,12 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 		pi.on("after_provider_response", async (event, ctx) => {
 			if (ctx.model?.provider !== PROVIDER) return;
 			watchdog?.response(event.status);
-			if (event.status !== 429) return;
+			if (event.status !== 429 && event.status !== 401) return;
 			if (watchdogRequestTimedOut) return;
 			if (!refreshConfig()) return;
 			const decision = getCurrentRequestRateLimitState()?.decision;
 			if (!decision) return;
+			if (event.status === 401) requestRateLimitState = undefined;
 			const usage = await fetchOpenCodeGoUsage(decision.target, fetchApi, options.timers);
 			if (!refreshConfig()) return;
 			if (!isCurrentUsageDecision(decision, config, usageDecisionEpoch)) return;
@@ -993,10 +994,11 @@ export function createOpencodeGoRotationExtension(options: ExtensionOptions = {}
 					getRateLimitedUntil(usage.usage, currentTime, getCooldownMs(config)),
 					currentTime,
 				);
-				markResponseRateLimitHandled(decision);
+				if (event.status === 429) markResponseRateLimitHandled(decision);
 				ctx.ui.notify(formatUsageStatus(usage), "warning");
 				return;
 			}
+			if (event.status === 401) return;
 			if (config.keys.length <= 1) {
 				markResponseRateLimitHandled(decision);
 				return;
