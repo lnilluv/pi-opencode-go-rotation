@@ -24,6 +24,10 @@ The first key added becomes active immediately.
 
 The extension sets the active key as a runtime override, which takes priority over `OPENCODE_API_KEY` environment variables and `auth.json` credentials.
 
+At extension load, before Pi resolves its startup model selection, the active key is also registered with the
+provider registry. This keeps saved `enabledModels`/scoped models matching `opencode-go` across restarts,
+because Pi resolves those before `session_start` runs. The runtime override above still follows each rotation.
+
 The extension has three recovery paths:
 
 1. **Usage-verified Go quota exhaustion**: when OpenCode Go returns HTTP 429, the extension sends the active key only to `https://opencode.ai/zen/go/v1/usage`. If a usage window is `rate-limited`, the failed key is blocked until the latest reported reset and the next non-quota-blocked key is activated. Rotation prefers keys outside transient cooldown, but can clear a cooldown rather than keep using an exhausted key. Repeated failures try each configured key once. When every key is quota-blocked, rotation stops and reports the earliest reset instead of cycling.

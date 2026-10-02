@@ -68,6 +68,21 @@ interface CommandRegistration {
 class FakePi {
 	readonly handlers: Record<string, EventHandler> = {};
 	readonly commands: Record<string, CommandRegistration> = {};
+	readonly providerRegistrations: Array<{ provider: string; apiKey: string | undefined }> = [];
+	readonly providerUnregistrations: string[] = [];
+	readonly registerProvider: ((provider: string, config: { apiKey?: string }) => void) | undefined;
+	readonly unregisterProvider: ((provider: string) => void) | undefined;
+
+	constructor(providerRegistration = true) {
+		if (providerRegistration) {
+			this.registerProvider = (provider, config) => {
+				this.providerRegistrations.push({ provider, apiKey: config.apiKey });
+			};
+			this.unregisterProvider = (provider) => {
+				this.providerUnregistrations.push(provider);
+			};
+		}
+	}
 
 	on(event: string, handler: EventHandler): void {
 		this.handlers[event] = handler;
@@ -196,10 +211,14 @@ async function withTempConfig(run: (configPath: string) => Promise<void>): Promi
 	}
 }
 
-function createHarness(registryShape: "authStorage" | "runtime" = "authStorage", fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) })): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
+function createHarness(
+	registryShape: "authStorage" | "runtime" = "authStorage",
+	fetch: FetchApi = async () => ({ ok: false, status: 404, json: async () => ({}) }),
+	providerRegistration = true,
+): { pi: FakePi; ctx: ExtensionContext; state: FakeContextState; timers: FakeTimers; clock: FakeClock } {
 	const timers = new FakeTimers();
 	const clock = new FakeClock();
-	const pi = new FakePi();
+	const pi = new FakePi(providerRegistration);
 	const state: FakeContextState = { runtimeKeys: [], notifications: [], aborts: 0 };
 	const ctx = createContext(state, registryShape);
 	const extension = createOpencodeGoRotationExtension({ timers, clock, fetch });
@@ -241,6 +260,58 @@ test("session start supports the current model registry runtime store", async ()
 
 		await pi.emit("session_start", { reason: "start" }, ctx);
 
+		assert.equal(state.runtimeKeys.at(-1), "sk-one");
+	});
+});
+
+test("factory advertises the active key before startup model selection", async () => {
+	await withTempConfig(async () => {
+		const { pi, state } = createHarness();
+
+		assert.deepEqual(pi.providerRegistrations, [{ provider: "opencode-go", apiKey: "sk-one" }]);
+		assert.deepEqual(state.runtimeKeys, []);
+	});
+});
+
+test("config mutations re-advertise the provider", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness();
+
+		await pi.runCommand("opencode", "next", ctx);
+
+		assert.deepEqual(pi.providerRegistrations.map((entry) => entry.apiKey), ["sk-one", "sk-two"]);
+		assert.equal(state.runtimeKeys.at(-1), "sk-two");
+	});
+});
+
+test("removing the last key clears the registered provider", async () => {
+	await withTempConfig(async (configPath) => {
+		writeFileSync(configPath, JSON.stringify({ keys: [{ name: "one", key: "sk-one" }] }), { mode: 0o600 });
+		const { pi, ctx } = createHarness();
+
+		await pi.runCommand("opencode", "remove 1", ctx);
+
+		assert.deepEqual(pi.providerRegistrations.map((entry) => entry.apiKey), ["sk-one"]);
+		assert.deepEqual(pi.providerUnregistrations, ["opencode-go"]);
+	});
+});
+
+test("factory advertises an available key when the active key is quota-blocked", async () => {
+	await withTempConfig(async (configPath) => {
+		patchConfig(configPath, { quotaBlockedUntil: { 0: 4_102_444_800_000 } });
+		const { pi } = createHarness();
+
+		assert.deepEqual(pi.providerRegistrations, [{ provider: "opencode-go", apiKey: "sk-two" }]);
+	});
+});
+
+test("older Pi versions without pi.registerProvider keep loading and rotating", async () => {
+	await withTempConfig(async () => {
+		const { pi, ctx, state } = createHarness("authStorage", undefined, false);
+
+		await pi.emit("session_start", { reason: "start" }, ctx);
+
+		assert.deepEqual(pi.providerRegistrations, []);
 		assert.equal(state.runtimeKeys.at(-1), "sk-one");
 	});
 });
