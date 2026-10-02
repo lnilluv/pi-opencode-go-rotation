@@ -655,6 +655,8 @@ export function createOpencodeGoRotationExtension(options = {}) {
         let usageDecisionEpoch = 0;
         let requestRateLimitState;
         const watchdogEvents = [];
+        /** Key currently advertised through the provider registry, if any. */
+        let registeredProviderKey;
         const now = () => options.clock?.now() ?? Date.now();
         const fetchApi = options.fetch ?? globalThis.fetch.bind(globalThis);
         function formatConfigError(error) {
@@ -680,6 +682,7 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 const updated = updateConfig(mutator);
                 config = updated.config;
                 configError = undefined;
+                syncRegisteredProvider();
                 return updated.result;
             }
             catch (error) {
@@ -692,6 +695,34 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 return true;
             ctx.ui.notify(`OpenCode: ${configError}. No configuration was changed.`, "error");
             return false;
+        }
+        /**
+         * Advertise the current key through the provider registry.
+         *
+         * Pi resolves `enabledModels`/scoped models during startup, before
+         * `session_start` runs, so a runtime key applied there is too late: every
+         * configured opencode-go pattern fails to match and the saved selection is
+         * dropped. Registering a key at load time marks the provider as configured
+         * for startup selection; the per-request runtime override still rotates keys.
+         */
+        function syncRegisteredProvider() {
+            const api = pi;
+            if (typeof api.registerProvider !== "function")
+                return;
+            const availableIndex = pickAvailableKeyIndex(config, now());
+            const entry = (availableIndex === undefined ? config.keys[config.activeKeyIndex] : config.keys[availableIndex])
+                ?? config.keys[0];
+            if (!entry) {
+                if (registeredProviderKey !== undefined) {
+                    registeredProviderKey = undefined;
+                    api.unregisterProvider?.(PROVIDER);
+                }
+                return;
+            }
+            if (entry.key === registeredProviderKey)
+                return;
+            registeredProviderKey = entry.key;
+            api.registerProvider(PROVIDER, { apiKey: entry.key });
         }
         function applySynchronizedActiveKey(ctx) {
             if (!refreshConfig())
@@ -707,7 +738,9 @@ export function createOpencodeGoRotationExtension(options = {}) {
                 if (selectedIndex === undefined)
                     return undefined;
             }
-            return applyActiveKey(config, ctx.modelRegistry, now());
+            const keyName = applyActiveKey(config, ctx.modelRegistry, now());
+            syncRegisteredProvider();
+            return keyName;
         }
         function invalidateAutomaticDecisions() {
             usageDecisionEpoch++;
@@ -974,6 +1007,11 @@ export function createOpencodeGoRotationExtension(options = {}) {
             });
             return imported === true;
         }
+        // Resolve the active key before Pi's startup model selection runs, so saved
+        // enabledModels/scoped models keep matching this provider. The runtime key
+        // override still follows rotations per request.
+        refreshConfig();
+        syncRegisteredProvider();
         pi.on("session_start", async (event, ctx) => {
             lastAppliedRuntimeKeys.delete(ctx.modelRegistry);
             invalidateAutomaticDecisions();
